@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import textwrap
 import threading
 import time
 import wave
@@ -32,7 +33,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 UPDATE_REPOSITORY = "stashforge/tick"
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "studytimer"
@@ -1926,17 +1927,32 @@ class TickParser(argparse.ArgumentParser):
     def format_help(self):
         if not self.help_rows:
             return super().format_help()
+        columns = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
         width = max(len(name) for name, _ in self.help_rows) + 2
-        commands = "\n".join(f"  {c('1;32', name.ljust(width))}{description}"
-                             for name, description in self.help_rows)
+        indent = " " * (width + 2)
+        commands = []
+        for name, description in self.help_rows:
+            if columns - len(indent) < 15:
+                commands.append("  " + c("1;32", name))
+                commands.append(textwrap.fill(description, width=columns,
+                                              initial_indent="    ", subsequent_indent="    "))
+            else:
+                first, *rest = textwrap.wrap(description, width=columns - len(indent))
+                commands.append(f"  {c('1;32', name.ljust(width))}{first}")
+                commands.extend(indent + line for line in rest)
+        command_text = "\n".join(commands)
+        options = ""
+        if "--version" in self._option_string_actions:
+            options = (f"\n{c('1;34', 'Options')}\n"
+                       f"  {c('1;32', '-v, --version')}  Show the installed version\n")
         examples = "\n".join(f"  {c('1;36', command)} {options}"
                              for command, options in self.examples)
         arguments = self.usage.removeprefix(self.prog) if self.usage else " <command> [options]"
         return f"""{c('1;34', 'Usage:')} {c('1;35', self.prog)}{arguments}
 
 {c('1;34', 'Commands')}
-{commands}
-
+{command_text}
+{options}
 {c('1;34', 'Examples')}
 {examples}
 
@@ -2221,7 +2237,8 @@ def main():
         examples=(("tick timer", '5m --label "Check the oven"'),
                   ("tick study pomo", "-s SQL")),
     )
-    p.add_argument("--version", action="version", version=f"tick {VERSION}")
+    p.add_argument("-v", "--version", action="version", version=f"tick {VERSION}",
+                   help="show the installed version")
     sub = p.add_subparsers(dest="mode")
     add_timer_commands(sub, study=False)
     add_reminder_commands(sub)
