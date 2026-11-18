@@ -1,0 +1,2287 @@
+#!/usr/bin/env python3
+"""tick - terminal countdowns, stopwatches, and Pomodoros with optional study logging."""
+import argparse
+import base64
+import hashlib
+import stat
+import calendar
+import fcntl
+import signal
+import uuid
+import math
+import unicodedata
+import json
+import os
+import re
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+import wave
+import tty
+from collections import defaultdict
+from contextlib import closing
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+VERSION = "0.1.0"
+UPDATE_REPOSITORY = "stashforge/tick"
+
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "studytimer"
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "studytimer"
+LOG_FILE = DATA_DIR / "sessions.jsonl"
+CONF_FILE = CONF_DIR / "config.json"
+STATUS_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / f"tick-{os.getuid()}"
+STATUS_FILE = STATUS_DIR / f"{os.getpid()}.status"
+
+DEFAULTS = {
+    "work_min": 25,
+    "short_min": 5,
+    "long_min": 15,
+    "cycles": 4,        # focus rounds before a long break
+    "goal_min": 120,    # daily goal, 0 = off
+    "notify": True,     # desktop notification (notify-send)
+    "bell": True,       # terminal bell
+    "sound": True,      # play an audio alert (works even when KDE DND blocks notifications)
+    "sound_file": "",   # path to your own sound; empty = freedesktop theme sound
+    "alert_max_sec": 60,  # alarm stops by itself after this many seconds; 0 = never
+    "ring": True,       # keep alerting until you dismiss it (key press or notification)
+}
+
+USE_COLOR = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+             and os.environ.get("TERM") != "dumb")
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else str(s)
+
+
+# ---------- config / log ----------
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        saved = json.loads(CONF_FILE.read_text())
+        if isinstance(saved, dict):
+            for key, default in DEFAULTS.items():
+                value = saved.get(key, default)
+                minimum = 1 if key in ("work_min", "cycles") else 0
+                if type(value) is type(default) and (type(value) is not int or value >= minimum):
+                    cfg[key] = value
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=CONF_DIR, delete=False) as f:
+        temp = Path(f.name)
+        try:
+            f.write(json.dumps(cfg, indent=2) + "\n")
+            f.close()
+            temp.replace(CONF_FILE)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+CFG = load_config()
+
+
+def load_sessions():
+    out = []
+    try:
+        with open(LOG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+def today_seconds():
+    t = date.today().isoformat()
+    return sum(s["seconds"] for s in load_sessions() if s["start"][:10] == t)
+
+
+def record(start, secs, subject, kind, completed):
+    """Append a focus session to the log. Ignores anything under a minute."""
+    if secs < 60:
+        return 0
+    before = today_seconds()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "start": start.isoformat(timespec="seconds"),
+        "end": datetime.now().isoformat(timespec="seconds"),
+        "seconds": int(secs),
+        "subject": subject or "",
+        "kind": kind,
+        "completed": completed,
+    }
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    goal = CFG["goal_min"] * 60
+    if start.date() == date.today() and goal and before < goal <= before + secs:
+        notify("Daily goal reached", f"You hit {fmt_dur(goal)} today. Nice.")
+    return secs
+
+
+# ---------- formatting ----------
+
+def fmt_clock(sec):
+    sec = max(0, int(sec))
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m = r // 60
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m"
+    return f"{sec}s"
+
+
+def parse_duration(s):
+    """'25' -> 25 min, '90s', '1h30m', '45m', '1:30:00', '25:00'."""
+    s = str(s).strip().lower()
+    try:
+        if re.fullmatch(r"\d+(\.\d+)?", s):
+            return int(float(s) * 60)
+        if ":" in s:
+            fields = s.split(":")
+            if not all(part.isdecimal() for part in fields):
+                raise ValueError
+            p = list(map(int, fields))
+            if any(part >= 60 for part in p[1:]):
+                raise ValueError
+            if len(p) == 2:
+                return p[0] * 60 + p[1]
+            if len(p) == 3:
+                return p[0] * 3600 + p[1] * 60 + p[2]
+            raise ValueError
+        m = re.fullmatch(r"(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?", s)
+        if not m or not any(m.groups()):
+            raise ValueError
+        h, mi, se = (int(x or 0) for x in m.groups())
+        return h * 3600 + mi * 60 + se
+    except (ValueError, OverflowError):
+        raise argparse.ArgumentTypeError(f"bad duration {s!r} (try 25, 45m, 1h30m, 90s)")
+
+
+def positive_duration(value):
+    seconds = parse_duration(value)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("duration must be at least one second")
+    return seconds
+
+
+def nonnegative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
+def positive_int(value):
+    number = nonnegative_int(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError("must be at least one")
+    return number
+
+
+def session_label(value):
+    if len(value) > 120 or len(value.split()) > 12:
+        raise argparse.ArgumentTypeError("use at most 12 words and 120 characters")
+    return " ".join(value.split())
+
+
+def sound_path(value):
+    path = Path(value).expanduser().resolve()
+    if not path.is_file() or not os.access(path, os.R_OK):
+        raise argparse.ArgumentTypeError(f"cannot read sound file: {path}")
+    return str(path)
+
+
+# ---------- terminal / notifications ----------
+
+DIGITS = {
+    "0": ("111", "101", "101", "101", "111"),
+    "1": ("010", "110", "010", "010", "111"),
+    "2": ("111", "001", "111", "100", "111"),
+    "3": ("111", "001", "111", "001", "111"),
+    "4": ("101", "101", "111", "001", "001"),
+    "5": ("111", "100", "111", "001", "111"),
+    "6": ("111", "100", "111", "101", "111"),
+    "7": ("111", "001", "001", "001", "001"),
+    "8": ("111", "101", "111", "101", "111"),
+    "9": ("111", "101", "111", "001", "111"),
+    ":": ("0", "1", "0", "1", "0"),
+    "−": ("0", "0", "1", "0", "0"),
+    " ": ("0", "0", "0", "0", "0"),
+}
+
+
+def large_clock(clock, scale):
+    rows = []
+    for row in range(5):
+        glyphs = ["".join(("█" if pixel == "1" else " ") * scale
+                          for pixel in DIGITS[char][row]) for char in clock]
+        line = glyphs[0]
+        for index, glyph in enumerate(glyphs[1:], start=1):
+            gap = 2 if ":" in clock[index - 1:index + 1] else 1
+            line += " " * gap + glyph
+        rows.append(line)
+    return rows
+
+
+class Keys:
+    """cbreak mode + non-blocking key reads. Degrades to sleeping if stdin isn't a tty."""
+
+    def __init__(self, args):
+        self.inline = args.inline
+        self.center = args.center
+        self.color = str(30 + args.color) if args.color is not None else None
+        self.bold = args.bold
+        self.progress = args.progress
+        self.show_elapsed = False
+        self.label = args.subject if args.study else args.label
+
+    def __enter__(self):
+        self.live = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.drawn = False
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        if self.fd is not None:
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        self.alternate = self.live and self.fd is not None and not self.inline
+        self.frame = None
+        if self.alternate:
+            sys.stdout.write("\033[?1049h")
+        if self.live:
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        return self
+
+    def __exit__(self, *exc):
+        if self.alternate:
+            sys.stdout.write("\033[?1049l")
+        else:
+            self.clear()
+        if self.fd is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        if self.live:
+            sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        try:
+            STATUS_FILE.unlink()
+        except OSError:
+            pass
+
+    def show(self, title, bar=(), controls="", *, clock=None, total="", fraction=None, state=()):
+        if not self.live:
+            return
+        size = shutil.get_terminal_size((80, 20))
+        width = max(1, size.columns - 1)
+        if self.alternate:
+            self.show_dashboard(title, bar, controls, clock, total, fraction, state, width, size.lines)
+            return
+        if fraction is not None:
+            bar = progress_rule(min(24, width), fraction, clock[1])
+        rows = [title, bar, control_parts(controls)]
+        if self.label:
+            labels = wrap_label(self.label, width, 2)
+            rows[:0] = [((line, "1"),) for line in labels] + [()]
+        lines = [styled_line(parts, width) for parts in rows]
+        if self.drawn and self.drawn != len(lines):
+            self.clear()
+        rewind = f"\r\033[{self.drawn - 1}A" if self.drawn else ""
+        sys.stdout.write(rewind + "\r" + "\r\n".join("\033[2K" + line for line in lines))
+        sys.stdout.flush()
+        self.drawn = len(lines)
+
+    def show_dashboard(self, title, bar, controls, clock, total, fraction, state, width, height):
+        artwork = []
+        scale = 2
+        if clock and height >= 11:
+            artwork = large_clock(clock[0], scale)
+            if len(artwork[0]) > width:
+                scale = 1
+                artwork = large_clock(clock[0], scale)
+        body = [title, bar] if bar else [title]
+        clock_width = 0
+        if artwork and len(artwork[0]) <= width:
+            clock_width = len(artwork[0])
+            body = [((row, clock[1]),) for row in artwork]
+            if total:
+                inset = (" " * (scale + 1), "39")
+                body.append((inset, *progress_rule(clock_width - len(inset[0]), fraction, clock[1]))
+                            if fraction is not None else ())
+                state = (inset, *state)
+            state_width = sum(cell_width(char) for text, _ in state for char in text)
+            if total and state_width + len(total) < clock_width:
+                padding = clock_width - state_width - len(total)
+                body.append((*state, (" " * padding + total, "39")))
+            else:
+                body.append(state)
+                if total:
+                    body.append(((total.rjust(clock_width), "39"),))
+        elif total:
+            compact_width = min(width, max(len(clock[0]), len(total)))
+            if fraction is not None:
+                body.append(progress_rule(compact_width, fraction, clock[1]))
+            body.append(((total.rjust(compact_width), "39"),))
+
+        footer = tuple(control_parts(controls)) if height > 1 else ()
+        space = max(1, height - bool(footer))
+        label_inset = scale + 1 if clock_width and total else 0
+        label_width = (clock_width or width) - label_inset
+        labels = wrap_label(self.label, label_width, min(2, max(0, space - len(body))))
+        prefix = "" if self.center else " " * label_inset
+        label_rows = [((prefix + label, "1"),) for label in labels]
+        if labels and len(label_rows) + len(body) < space:
+            label_rows.append(())
+        body[:0] = label_rows
+        first_row = max(1, (space - len(body)) // 2 + 1) if self.center else 1
+        rows = [(first_row + i, parts) for i, parts in enumerate(body[:space])]
+        if footer:
+            rows.append((height, footer))
+
+        frame = []
+        for row, parts in rows:
+            is_footer = bool(footer) and row == height
+            row_width = clock_width if clock_width and not is_footer else width
+            line = styled_line(parts, row_width)
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+            column = 1
+            if self.center:
+                is_label = row - first_row < len(labels) and not is_footer
+                group_width = clock_width if clock_width and not (is_footer or is_label) else sum(
+                    cell_width(char) for char in plain)
+                column = max(1, (width - group_width + (label_inset if is_label else 0)) // 2 + 1)
+            frame.append(f"\033[{row};{column}H{line}")
+        frame = "".join(frame)
+        if frame != self.frame:
+            sys.stdout.write("\033[H\033[2J" + frame)
+            sys.stdout.flush()
+            self.frame = frame
+
+    def clear(self):
+        if self.alternate:
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.flush()
+            self.frame = None
+        elif self.drawn:
+            steps = self.drawn - 1
+            sys.stdout.write(f"\r\033[{steps}A\033[2K" + "\033[1B\033[2K" * steps
+                             + f"\033[{steps}A")
+            sys.stdout.flush()
+            self.drawn = False
+
+    def alert_body(self, message):
+        return f"{self.label} · {message}" if self.label else message
+
+    def change_sound(self):
+        if self.fd is None:
+            return
+        self.clear()
+        stop_sound()
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        try:
+            print("\033[?25h" if self.live else "", end="")
+            value = input("Sound path (blank keeps current sound): ").strip()
+            if value:
+                CFG["sound_file"] = sound_path(value)
+                CFG["sound"] = True
+        except (EOFError, KeyboardInterrupt):
+            print()
+        except argparse.ArgumentTypeError as e:
+            print(e, file=sys.stderr)
+        finally:
+            tty.setcbreak(self.fd)
+            if self.live:
+                print("\033[?25l", end="", flush=True)
+
+    def get(self, timeout):
+        if self.fd is None:
+            time.sleep(timeout)
+            return None
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if r:
+            return os.read(self.fd, 1).decode(errors="ignore")
+        return None
+
+
+SOUND_DIRS = ["/usr/share/sounds/freedesktop/stereo", "/usr/share/sounds/ocean/stereo"]
+SOUND_NAMES = ["alarm-clock-elapsed.oga", "complete.oga", "bell.oga", "message.oga"]
+PLAYERS = [
+    ["pw-play"],
+    ["paplay"],
+    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"],
+    ["mpv", "--no-video", "--really-quiet"],
+]
+
+
+def find_sound():
+    custom = os.path.expanduser(CFG["sound_file"])
+    if custom and os.path.exists(custom):
+        return custom
+    for d in SOUND_DIRS:
+        for n in SOUND_NAMES:
+            p = os.path.join(d, n)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def _silence_file():
+    """0.5s of silence. Played first so an idle/suspended audio sink wakes up
+    before the real alert, otherwise the start of a short sound can be lost."""
+    STATUS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    p = STATUS_DIR / "silence.wav"
+    if not p.exists():
+        with tempfile.NamedTemporaryFile(dir=STATUS_DIR, delete=False) as temp:
+            path = Path(temp.name)
+            try:
+                with wave.open(temp, "wb") as w:
+                    w.setnchannels(2)
+                    w.setsampwidth(2)
+                    w.setframerate(44100)
+                    w.writeframes(b"\x00" * (22050 * 4))
+                temp.flush()
+                path.replace(p)
+            finally:
+                path.unlink(missing_ok=True)
+    return str(p)
+
+
+def _sound_log(msg):
+    try:
+        STATUS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with open(STATUS_DIR / "sound.log", "a") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except OSError:
+        pass
+
+
+_SND = {"proc": None, "thread": None, "stop": False, "last_end": 0.0}
+
+
+def _player_cmd(cmd, f, cap=None):
+    """Wrap the player in `timeout` so a long file is cut off after the cap."""
+    t = cap if cap is not None else CFG["alert_max_sec"]
+    pre = ["timeout", "-k", "1", str(t)] if t and shutil.which("timeout") else []
+    return pre + cmd + [f]
+
+
+def _run(argv):
+    p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _SND["proc"] = p
+    err = p.communicate()[1]
+    _SND["last_end"] = time.monotonic()
+    return p.returncode, err.decode(errors="ignore").strip().replace("\n", " | ")
+
+
+def _play(f):
+    """Try each available player until one succeeds; log every attempt."""
+    for cmd in PLAYERS:
+        if _SND["stop"]:
+            return
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            if time.monotonic() - _SND["last_end"] > 3:  # sink may be asleep: wake it first
+                _run(_player_cmd(cmd, _silence_file(), 3))
+                if _SND["stop"]:
+                    return
+            rc, err = _run(_player_cmd(cmd, f))
+            _sound_log(f"{cmd[0]} exit={rc} file={f} {err}")
+            if rc in (0, 124):  # 124 = hit the length cap, still played
+                _SND["played"] = True
+                return
+            if _SND["stop"]:
+                return
+        except OSError as e:
+            _sound_log(f"{cmd[0]} error={e}")
+
+
+def play_sound():
+    """Start one alert in the background. Skipped if the previous one is still playing."""
+    if not CFG["sound"]:
+        return
+    t = _SND["thread"]
+    if t and t.is_alive():
+        return
+    f = find_sound()
+    if not f:
+        return
+    _SND["stop"] = False
+    _SND["thread"] = threading.Thread(target=_play, args=(f,), daemon=True)
+    _SND["thread"].start()
+
+
+def stop_sound():
+    _SND["stop"] = True
+    p = _SND["proc"]
+    if p and p.poll() is None:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
+def drain_sound():
+    """At exit, let a one-shot alert finish (bounded), without ever hanging."""
+    t = _SND["thread"]
+    if t and t.is_alive() and not _SND["stop"]:
+        try:
+            t.join((CFG["alert_max_sec"] or 30) + 4)
+        except KeyboardInterrupt:
+            stop_sound()
+
+
+def notify(title, body):
+    play_sound()
+    if CFG["bell"]:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+    if CFG["notify"] and shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", "studytimer", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+RING_EVERY = 4  # seconds between repeated alerts
+
+
+def _notify_persistent(title, body, stop, actions=("stop=Stop",)):
+    """Return a notification handle with the chosen action, if any."""
+    h = {"proc": None, "id": None, "closing": False, "action": ""}
+    if not (CFG["notify"] and shutil.which("notify-send")):
+        return h
+    try:
+        p = subprocess.Popen(
+            ["notify-send", "-a", "studytimer", "-u", "critical", "--print-id",
+             *[f"--action={action}" for action in actions], "--wait", title, body],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return h
+    h["proc"] = p
+
+    def watch():
+        try:
+            first = p.stdout.readline().strip()
+            if first.isdigit():
+                h["id"] = first
+            h["action"] = p.stdout.read().strip()
+            p.wait()
+            if h["closing"]:
+                return
+            if p.returncode == 0:
+                stop.set()
+            else:  # old libnotify without --wait/--action: fall back to a plain notification
+                subprocess.Popen(["notify-send", "-a", "studytimer", title, body],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    threading.Thread(target=watch, daemon=True).start()
+    return h
+
+
+def _close_notification(h):
+    p = h["proc"]
+    if p and p.poll() is None:
+        h["closing"] = True
+        p.terminate()
+        if h["id"] and shutil.which("gdbus"):
+            try:
+                subprocess.run(
+                    ["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                     "--object-path", "/org/freedesktop/Notifications",
+                     "--method", "org.freedesktop.Notifications.CloseNotification", h["id"]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
+def ring(keys, title, body, accept=None):
+    """Alarm: replays the sound back-to-back (any length) until a key is pressed (any key,
+    or one of `accept`), the notification is dismissed, or alert_max_sec passes.
+    Returns the key pressed, "timeout", or None (notification dismissed)."""
+    body = keys.alert_body(body)
+    if keys.fd is None:  # not a tty: alert once, don't block
+        notify(title, body)
+        return None
+    stop = threading.Event()
+    h = _notify_persistent(title, body, stop)
+    keys.show(((title, "1;33"),), controls="Any key: silence")
+    limit = CFG["alert_max_sec"]
+    end = time.monotonic() + limit if limit else None
+    use_bell = CFG["bell"] and not (CFG["sound"] and find_sound())
+    key, last_bell = None, 0.0
+    try:
+        while not stop.is_set():
+            now = time.monotonic()
+            if end and now >= end:
+                key = "timeout"
+                break
+            play_sound()  # no-op while the previous play is running, so it replays seamlessly
+            if use_bell and now - last_bell >= RING_EVERY:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+                last_bell = now
+            k = keys.get(0.2)
+            if k and (accept is None or k in accept):
+                key = k
+                stop.set()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_sound()
+        _close_notification(h)
+    return key
+
+
+def write_status(text):
+    """Expose each running timer separately for status bars."""
+    try:
+        STATUS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        STATUS_FILE.write_text(text)
+    except OSError:
+        pass
+
+
+def cell_width(char):
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def wrap_label(text, width, max_lines):
+    if not text or width < 1 or max_lines < 1:
+        return []
+    lines = []
+    rest = text
+    while rest and len(lines) < max_lines:
+        used = 0
+        end = 0
+        for char in rest:
+            size = cell_width(char)
+            if used + size > width:
+                break
+            used += size
+            end += 1
+        if end == len(rest):
+            lines.append(rest)
+            return lines
+        if len(lines) == max_lines - 1 or end == 0:
+            line = rest[:end].rstrip()
+            while sum(map(cell_width, line)) >= width:
+                line = line[:-1]
+            lines.append(line.rstrip() + "…")
+            return lines
+        split = rest.rfind(" ", 0, end + 1)
+        cut = split if split > 0 else end
+        lines.append(rest[:cut])
+        rest = rest[cut:].lstrip()
+    return lines
+
+
+def styled_line(parts, width):
+    line = []
+    for text, style in parts:
+        segment = []
+        for char in text:
+            char = char if char.isprintable() else " "
+            size = cell_width(char)
+            if size > width:
+                line.append(c(style, "".join(segment)))
+                return "".join(line)
+            segment.append(char)
+            width -= size
+        if segment:
+            line.append(c(style, "".join(segment)))
+    return "".join(line)
+
+
+def control_parts(controls):
+    if not controls:
+        return
+    for index, control in enumerate(controls.split(" · ")):
+        if index:
+            yield "    ", "39"
+        key, space, action = control.partition(" ")
+        yield key, "36"
+        yield space + action, "2;39"
+
+
+def progress_rule(width, fraction, color):
+    filled = int(width * fraction) if fraction is not None else 0
+    return (("━" * filled, color), ("─" * (width - filled), "2;90"))
+
+
+def run_phase(keys, label, target, color, count_up=False, can_skip=False):
+    """Return elapsed seconds, outcome, and seconds left."""
+    elapsed, paused = 0.0, False
+    last = time.monotonic()
+    outcome = "quit"
+    color = keys.color or color
+    clock_style = f"1;{color}" if keys.bold else color
+    try:
+        while True:
+            now = time.monotonic()
+            if not paused:
+                elapsed += now - last
+            last = now
+            left = max(0, math.ceil(target - elapsed))
+            status_clock = fmt_clock(elapsed if count_up else left)
+            showing_elapsed = count_up or keys.show_elapsed
+            clock = fmt_clock(elapsed) if showing_elapsed else f"−{status_clock}"
+            state = " · Paused" if paused else ""
+            mode = "Elapsed" if showing_elapsed else "Remaining"
+            fraction = min(1, elapsed / target) if target else 1
+            if count_up or not keys.progress:
+                fraction = None
+            controls = ["Space resume" if paused else "Space pause"]
+            if not count_up:
+                controls.extend(("+/- 1m", "v elapsed/left"))
+            if can_skip:
+                controls.append("s skip")
+            controls.extend(("c change sound", "q stop"))
+            status_label = f"{label} · {keys.label}" if keys.label else label
+            write_status(f"{status_label} {status_clock}{state}")
+            details = ((label, "1"), (f" · {mode}", "90"), (state, "1;33"))
+            title = ((clock, clock_style), ("  ·  ", "90"), *details)
+            artwork_clock = f" {clock}" if showing_elapsed and not count_up else clock
+            total = "" if count_up else fmt_clock(target)
+            if total.count(":") == 2:
+                sign = " " if showing_elapsed else "−"
+                digits = clock.lstrip("−").split(":")
+                if len(digits) == 2:
+                    digits.insert(0, "0")
+                digits[0] = digits[0].zfill(len(total.split(":")[0]))
+                artwork_clock = sign + ":".join(digits)
+            keys.show(title, controls=" · ".join(controls) if keys.fd is not None else "",
+                      clock=(artwork_clock, clock_style), total=total,
+                      fraction=fraction, state=details)
+            if not count_up and elapsed >= target:
+                return int(target), "done", 0
+
+            k = keys.get(0.2)
+            # Charge the interval before processing a pause, stop, or edit.
+            now = time.monotonic()
+            if not paused:
+                elapsed += now - last
+            last = now
+            if not count_up and elapsed >= target:
+                return int(target), "done", 0
+            if k == "m":
+                stop_sound()
+            elif k == "c":
+                keys.change_sound()
+                last = time.monotonic()
+            elif k in (" ", "p"):
+                paused = not paused
+            elif k == "s":
+                outcome = "skip"
+                break
+            elif k == "q":
+                break
+            elif k == "v" and not count_up:
+                keys.show_elapsed = not keys.show_elapsed
+            elif k == "+" and not count_up:
+                target += 60
+            elif k == "-" and not count_up:
+                target = max(elapsed, target - 60)
+    except KeyboardInterrupt:
+        pass
+    return int(elapsed), outcome, max(0, math.ceil(target - elapsed))
+
+
+def wait_next(keys, prompt, alert=None):
+    """Wait for explicit confirmation, independently of the reminder."""
+    wait_title = "Break ready" if prompt == "Start break" else "Ready to resume focus"
+    controls = f"Enter {prompt.lower()} · m silence · z snooze 5m · c change sound · q stop"
+    write_status(f"Waiting to {prompt.lower()}")
+    if keys.fd is None and not (CFG["notify"] and shutil.which("notify-send")):
+        print("  Manual transitions require a terminal or actionable desktop notifications. Use --auto for unattended runs.")
+        return False
+
+    h = None
+    closed = None
+    snoozed_until = None
+    ring_until = None
+    last_bell = float("-inf")
+    try:
+        while True:
+            now = time.monotonic()
+            if h is None and (snoozed_until is None or now >= snoozed_until):
+                closed = threading.Event()
+                title, body = alert or (prompt, "Ready when you are.")
+                h = _notify_persistent(title, keys.alert_body(body), closed,
+                                       (f"start={prompt}", "mute=Silence", "snooze=Remind in 5 min"))
+                snoozed_until = None
+                if keys.fd is None and h["proc"] is None:
+                    return False
+                if alert:
+                    if CFG["ring"]:
+                        limit = CFG["alert_max_sec"]
+                        ring_until = now + limit if limit else float("inf")
+                    else:
+                        play_sound()
+                        if CFG["bell"]:
+                            print("\a", end="", flush=True)
+
+            if ring_until is not None:
+                if now >= ring_until:
+                    stop_sound()
+                    ring_until = None
+                else:
+                    play_sound()
+                    if CFG["bell"] and not (CFG["sound"] and find_sound()) and now - last_bell >= RING_EVERY:
+                        print("\a", end="", flush=True)
+                        last_bell = now
+
+            status = "Reminder snoozed" if snoozed_until is not None else ""
+            keys.show(((wait_title, "1;33"),), ((status, "90"),),
+                      controls if keys.fd is not None else "")
+            action = {"\n": "start", "\r": "start", " ": "start", "q": "quit",
+                      "m": "mute", "z": "snooze", "c": "sound"}.get(keys.get(0.2))
+            if closed is not None and closed.is_set() and h is not None:
+                action = action or h["action"] or "dismiss"
+                if keys.fd is None and action in ("dismiss", "mute"):
+                    # Without terminal controls, dismissal ends the waiting run.
+                    return False
+            if keys.fd is None and h and h["proc"] and h["proc"].poll() not in (None, 0):
+                return False
+            if action == "start":
+                return True
+            if action == "quit":
+                return False
+            if action in ("mute", "dismiss", "snooze", "sound"):
+                stop_sound()
+                ring_until = None
+            if action == "sound":
+                keys.change_sound()
+            if action == "snooze":
+                if h:
+                    _close_notification(h)
+                h = None
+                snoozed_until = time.monotonic() + 300
+            elif closed is not None and closed.is_set():
+                closed.clear()
+    except KeyboardInterrupt:
+        return False
+    finally:
+        stop_sound()
+        if h:
+            _close_notification(h)
+
+
+# ---------- commands ----------
+
+def cmd_pomo(a):
+    work = a.work if a.work is not None else CFG["work_min"] * 60
+    short = a.short if a.short is not None else CFG["short_min"] * 60
+    long_ = a.long if a.long is not None else CFG["long_min"] * 60
+    auto = a.auto
+    cycles = a.cycles if a.cycles is not None else CFG["cycles"]
+    rounds, total, logged = 0, 0, 0
+    with Keys(a) as keys:
+        while True:
+            rounds += 1
+            start = datetime.now()
+            round_label = f"{rounds}/{a.rounds}" if a.rounds else str(rounds)
+            secs, why, _ = run_phase(keys, f"Focus {round_label}",
+                                     work, "33", can_skip=True)
+            total += secs
+            if a.study:
+                logged += record(start, secs, a.subject, "pomodoro", why == "done")
+            final = bool(a.rounds and rounds >= a.rounds)
+            if why == "done" and final and CFG["ring"]:
+                ring(keys, "Focus done", "All rounds complete.")
+            elif why == "done" and (auto or final):
+                notify("Focus done", keys.alert_body("Take a break."))
+            if why == "quit" or final:
+                break
+            is_long = rounds % cycles == 0
+            brk = long_ if is_long else short
+            if not auto and not wait_next(
+                    keys, "Start break",
+                    alert=("Focus done", "Time for a break") if why == "done" else None):
+                break
+            secs, why, _ = run_phase(keys, "Long break" if is_long else "Break",
+                                     brk, "32", can_skip=True)
+            if why == "done" and auto:
+                notify("Break over", keys.alert_body("Back to focus."))
+            if why == "quit":
+                break
+            if not auto and not wait_next(
+                    keys, "Resume focus",
+                    alert=("Break over", "Back to focus") if why == "done" else None):
+                break
+    summary = f"{rounds} {'round' if rounds == 1 else 'rounds'} · {fmt_dur(total)} focused"
+    if a.study:
+        summary += f" · {fmt_dur(logged)} logged · {fmt_dur(today_seconds())} today"
+    print(summary)
+
+
+def cmd_stopwatch(a):
+    start = datetime.now()
+    with Keys(a) as keys:
+        secs, why, _ = run_phase(keys, "Stopwatch", 0, "36", count_up=True)
+    got = record(start, secs, a.subject, "stopwatch", why != "skip") if a.study else None
+    print_elapsed(a, secs, got, why)
+
+
+def cmd_timer(a):
+    start = datetime.now()
+    with Keys(a) as keys:
+        secs, why, left = run_phase(keys, "Timer", a.duration, "34")
+        got = record(start, secs, a.subject, "timer", why == "done") if a.study else None
+        if why == "done":
+            if CFG["ring"]:
+                ring(keys, "Timer finished", f"{fmt_dur(secs)} done.")
+            else:
+                notify("Timer finished", keys.alert_body(f"{fmt_dur(secs)} done."))
+    print_elapsed(a, secs, got, why, left)
+
+
+def fmt_full_duration(seconds):
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return " ".join(f"{value}{unit}" for value, unit in
+                    ((hours, "h"), (minutes, "m"), (seconds, "s")) if value) or "0s"
+
+
+def print_elapsed(args, secs, logged, why="quit", left=0):
+    status = "Finished" if why == "done" else "Stopped"
+    summary = f"{status} after {fmt_full_duration(secs)}"
+    if left:
+        summary += f" · {fmt_full_duration(left)} left"
+    if args.study and not logged:
+        summary += " (under 1 min, not logged)"
+    print(summary)
+
+
+def cmd_stats(a):
+    sessions = load_sessions()
+    if not sessions:
+        print("No sessions yet. Run `tick study` to start one.")
+        return
+    by_day, by_subj = defaultdict(int), defaultdict(int)
+    today = date.today()
+    cutoff = (today - timedelta(days=a.days - 1)).isoformat()
+    for s in sessions:
+        d = s["start"][:10]
+        by_day[d] += s["seconds"]
+        if d >= cutoff:
+            by_subj[s["subject"] or "(none)"] += s["seconds"]
+
+    goal = CFG["goal_min"] * 60
+    t = by_day.get(today.isoformat(), 0)
+    line = f"Today  {c('1', fmt_dur(t))}"
+    if goal:
+        pct = min(1.0, t / goal)
+        line += f"  [{c('32', '█' * int(20 * pct))}{'░' * (20 - int(20 * pct))}] {int(pct * 100)}% of {fmt_dur(goal)}"
+    print(line)
+
+    print(f"\nLast {a.days} days")
+    days = [(today - timedelta(days=i)) for i in range(a.days - 1, -1, -1)]
+    mx = max([by_day.get(d.isoformat(), 0) for d in days] + [1])
+    for d in days:
+        v = by_day.get(d.isoformat(), 0)
+        bar = "█" * round(24 * v / mx)
+        print(f"  {d.strftime('%a %d')}  {c('36', bar):<{24 + (9 if USE_COLOR else 0)}} {fmt_dur(v) if v else ''}")
+
+    if by_subj:
+        print(f"\nSubjects (last {a.days} days)")
+        for name, v in sorted(by_subj.items(), key=lambda x: -x[1]):
+            print(f"  {name:<20} {fmt_dur(v)}")
+
+    streak, d = 0, today
+    if by_day.get(d.isoformat(), 0) == 0:
+        d -= timedelta(days=1)
+    while by_day.get(d.isoformat(), 0) > 0:
+        streak += 1
+        d -= timedelta(days=1)
+    best_day, best = max(by_day.items(), key=lambda x: x[1])
+    print(f"\nStreak {streak} day(s) · best day {fmt_dur(best)} ({best_day}) · "
+          f"all-time {fmt_dur(sum(by_day.values()))} over {len(sessions)} sessions")
+
+
+def cmd_log(a):
+    sessions = load_sessions()[-a.n:] if a.n else []
+    if not sessions:
+        print("No sessions yet.")
+        return
+    for s in sessions:
+        mark = "✓" if s.get("completed") else "·"
+        print(f"{s['start'].replace('T', ' ')[:16]}  {fmt_dur(s['seconds']):>7}  "
+              f"{s['kind']:<9} {mark}  {s['subject']}")
+
+
+def cmd_sound(a):
+    """Diagnose audio alerts: shows the file, players, and any errors."""
+    custom = os.path.expanduser(CFG["sound_file"])
+    print(f"sound enabled : {CFG['sound']}")
+    if not CFG["sound"]:
+        print("  ^ alerts are OFF, so timers won't play sound. Fix: tick config sound true")
+    if custom and not os.path.exists(custom):
+        print(f"sound_file    : NOT FOUND ({custom}), falling back to theme sound")
+    f = find_sound()
+    print(f"file          : {f}")
+    if not f:
+        print("\nNo sound file. Run: sudo pacman -S sound-theme-freedesktop, or set sound_file.")
+        return
+    players = [cmd for cmd in PLAYERS if shutil.which(cmd[0])]
+    print(f"players found : {', '.join(c_[0] for c_ in players) or 'none'}")
+    if not players:
+        print("\nNo player. Install pipewire (pw-play), libpulse (paplay), ffmpeg or mpv.")
+        return
+    for cmd in players:
+        print(f"\n> {' '.join(_player_cmd(cmd, f))}")
+        r = subprocess.run(_player_cmd(cmd, f))
+        print(f"  exit code {r.returncode}" + ("  (played, so you should have heard it)" if r.returncode == 0 else "  (failed)"))
+        if r.returncode == 0:
+            break
+
+
+def cmd_goal(a):
+    if a.duration is None:
+        g = CFG["goal_min"]
+        print(f"Daily goal: {fmt_dur(g * 60) if g else 'off'}")
+        return
+    if a.duration % 60:
+        sys.exit("daily goal must be a whole number of minutes (use 0 to turn it off)")
+    CFG["goal_min"] = a.duration // 60
+    save_config(CFG)
+    print(f"Daily goal set to {fmt_dur(a.duration) if a.duration else 'off'}")
+
+
+def cmd_config(a):
+    shared_keys = [key for key in DEFAULTS if key != "goal_min"]
+    if not a.key:
+        for key in shared_keys:
+            print(f"{key:<11} {CFG[key]}")
+        print(f"\n{CONF_FILE}")
+        return
+    if a.key not in DEFAULTS:
+        sys.exit(f"unknown key {a.key!r}. keys: {', '.join(shared_keys)}")
+    if a.value is None:
+        print(CFG[a.key])
+        return
+    cur = DEFAULTS[a.key]
+    if isinstance(cur, bool):
+        v = a.value.lower()
+        if v not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+            hint = "  (to set a sound file use: tick config sound_file <path>)" if a.key == "sound" else ""
+            sys.exit(f"{a.key} expects true/false, got {a.value!r}{hint}")
+        CFG[a.key] = v in ("1", "true", "yes", "on")
+    elif isinstance(cur, str):
+        CFG[a.key] = a.value
+    else:
+        parse = positive_int if a.key in ("work_min", "cycles") else nonnegative_int
+        try:
+            CFG[a.key] = parse(a.value)
+        except (ValueError, argparse.ArgumentTypeError) as e:
+            sys.exit(f"invalid value for {a.key}: {e}")
+    save_config(CFG)
+    print(f"{a.key} = {CFG[a.key]}")
+
+
+def add_timer_commands(sub, study):
+    s = sub.add_parser("pomo", aliases=["p"], help="pomodoro cycles")
+    s.add_argument("-w", "--work", type=positive_duration, help="focus length, e.g. 50 or 50m")
+    s.add_argument("-b", "--short", type=parse_duration, help="short break")
+    s.add_argument("-l", "--long", type=parse_duration, help="long break")
+    s.add_argument("--cycles", type=positive_int, help="focus rounds between long breaks")
+    s.add_argument("-r", "--rounds", type=nonnegative_int, default=0, help="stop after N focus rounds (0 is unlimited)")
+    advance = s.add_mutually_exclusive_group()
+    advance.add_argument("--auto", dest="auto", action="store_true", help="start the next phase automatically")
+    advance.add_argument("--manual", dest="auto", action="store_false", help="wait for confirmation between phases (default)")
+    s.set_defaults(func=cmd_pomo, auto=False)
+    pomo = s
+
+    s = sub.add_parser("stopwatch", aliases=["sw"], help="count up until you stop")
+    s.set_defaults(func=cmd_stopwatch)
+    stopwatch = s
+
+    s = sub.add_parser("timer", aliases=["t"], help="one-off countdown")
+    s.add_argument("duration", type=positive_duration, help="e.g. 45, 1h30m, 90s")
+    s.set_defaults(func=cmd_timer)
+
+    for command in (pomo, stopwatch, s):
+        command.set_defaults(study=study)
+        command.add_argument("--inline", action="store_true",
+                             help="show the compact timer on the normal terminal screen")
+        command.add_argument("-c", "--center", action="store_true",
+                             help="center the clock on the alternate screen")
+        command.add_argument("-C", "--color", type=int, choices=range(8), metavar="0-7",
+                             help="clock color: black, red, green, yellow, blue, magenta, cyan, white")
+        bold_flags = ("-B", "--bold") if command is pomo else ("-B", "-b", "--bold")
+        command.add_argument(*bold_flags, action="store_true", help="use bold clock colors")
+        progress = command.add_mutually_exclusive_group()
+        progress.add_argument("-P", "--progress", action="store_true",
+                              help="show countdown progress in the divider")
+        progress.add_argument("--no-progress", dest="progress", action="store_false",
+                              help=argparse.SUPPRESS)
+        if study:
+            command.add_argument("-s", "--subject", type=session_label, default="",
+                                 help="study subject (up to 12 words and 120 characters)")
+        else:
+            command.add_argument("--label", type=session_label, default="",
+                                 help="timer label (up to 12 words and 120 characters)")
+        sound = command.add_mutually_exclusive_group()
+        sound.add_argument("--sound", type=sound_path, help="sound file for this run")
+        sound.add_argument("--mute", action="store_true", help="silence this run; keep desktop reminders")
+
+
+def add_study_commands(p):
+    sub = p.add_subparsers(dest="cmd")
+    add_timer_commands(sub, study=True)
+    s = sub.add_parser("stats", help="progress and streaks")
+    s.add_argument("-d", "--days", type=positive_int, default=7)
+    s.set_defaults(func=cmd_stats)
+
+    s = sub.add_parser("log", help="recent sessions")
+    s.add_argument("-n", type=nonnegative_int, default=10)
+    s.set_defaults(func=cmd_log)
+
+    s = sub.add_parser("goal", help="show/set daily goal")
+    s.add_argument("duration", nargs="?", type=parse_duration)
+    s.set_defaults(func=cmd_goal)
+
+    # Keep the original study command paths available for existing callers.
+    add_shared_commands(sub)
+
+
+def add_shared_commands(sub):
+    s = sub.add_parser("sound", help="test/diagnose the audio alert")
+    s.set_defaults(func=cmd_sound)
+
+    s = sub.add_parser("config", help="show/set defaults")
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?")
+    s.set_defaults(func=cmd_config)
+
+
+
+# ---------- reminder schedules ----------
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def reminder_time(value):
+    match = re.fullmatch(r"([0-9]{1,2})(?::([0-9]{2}))?\s*(am|pm)?", value.strip(), re.I)
+    if match:
+        hour, minute, suffix = match.groups()
+        h, m = int(hour), int(minute or 0)
+        if suffix and 1 <= h <= 12 and m < 60:
+            return f"{h % 12 + (12 if suffix.lower() == 'pm' else 0):02d}:{m:02d}"
+        if not suffix and minute is not None and h < 24 and m < 60:
+            return f"{h:02d}:{m:02d}"
+    raise argparse.ArgumentTypeError("use a valid time such as 09:30, 9:30am, or '9:30 PM'")
+
+
+def reminder_days(value):
+    value = value.strip().lower()
+    groups = {"all": WEEKDAYS, "weekdays": WEEKDAYS[:5], "weekends": WEEKDAYS[5:]}
+    days = groups.get(value, [day.strip() for day in value.split(",")])
+    if any(day not in WEEKDAYS for day in days):
+        raise argparse.ArgumentTypeError("use all, weekdays, weekends, or a list like mon,wed,fri")
+    return ",".join(day for day in WEEKDAYS if day in days)
+
+
+def system_zone():
+    localtime = Path("/etc/localtime")
+    parts = localtime.resolve().parts
+    if "zoneinfo" in parts:
+        name = "/".join(parts[parts.index("zoneinfo") + 1:])
+        if name and not name.startswith(("posix/", "right/")):
+            return ZoneInfo.no_cache(name), name
+    with localtime.open("rb") as source:
+        return ZoneInfo.from_file(source), None
+
+
+def timezone_policy(value):
+    value = value.strip()
+    aliases = {"system": "system", "local-fixed": "local-fixed", "utc": "UTC"}
+    return aliases.get(value.lower(), value)
+
+
+def reminder_zone(policy, local):
+    return local[0] if policy == "system" else ZoneInfo(policy)
+
+
+def reminder_window(value):
+    parts = re.split(r"\s*(?:\.\.|-)\s*", value.strip())
+    if len(parts) == 2:
+        try:
+            return tuple(map(reminder_time, parts))
+        except argparse.ArgumentTypeError:
+            pass
+    raise argparse.ArgumentTypeError("use two clock times, e.g. 08:00-21:00 or '10pm-2am'; use --from and --until for dates")
+
+
+def reminder_boundary(value):
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2})(?:[ T](.+))?", value.strip())
+    if match:
+        day, clock = match.groups()
+        try:
+            date.fromisoformat(day)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid calendar date: {day}") from None
+        return f"{day} {reminder_time(clock)}" if clock else day
+    raise argparse.ArgumentTypeError("use YYYY-MM-DD or 'YYYY-MM-DD 2pm'")
+
+
+def boundary_wall(value, end=False):
+    if not value:
+        return None
+    if len(value) == 10:
+        value += " 23:59:59" if end else " 00:00"
+    return datetime.fromisoformat(value)
+
+
+def clock_seconds(clock):
+    hour, minute = map(int, clock.split(":"))
+    return hour * 3600 + minute * 60
+
+
+def window_length(start, end):
+    return (clock_seconds(end) - clock_seconds(start)) % 86400 or 86400
+
+
+def upcoming_reminders(rule, zone, now, limit):
+    _, at, days, _, _, every, opens, closes, start, end, on_date, month_day, paused, at_start, _, _ = rule
+    if paused == "manual":
+        return
+    if paused:
+        now = max(now, datetime.fromisoformat(paused) - timedelta(microseconds=1))
+    lower = boundary_wall(start)
+    upper = boundary_wall(end, end=True)
+    local_now = now.astimezone(zone).replace(tzinfo=None)
+    start_day = max(local_now, lower or local_now).date().toordinal()
+    if every:
+        # The previous eligible day can have a window extending past midnight.
+        start_day = max(1, start_day - 1)
+        offsets = range(clock_seconds(opens) + (0 if at_start else every),
+                        clock_seconds(opens) + window_length(opens, closes) + 1, every)
+    else:
+        offsets = (clock_seconds(at),)
+    weekdays = {WEEKDAYS.index(day) for day in days.split(",")}
+    specific = date.fromisoformat(on_date).toordinal() if on_date else None
+    if specific:
+        start_day = max(start_day, specific)
+    found = 0
+    last_instant = None
+    last_day = upper.date().toordinal() if upper else date.max.toordinal()
+    last_anchor = min(last_day, specific) if specific else last_day
+    for ordinal in range(start_day, min(start_day + (400 if month_day else 60), last_anchor + 1)):
+        day = date.fromordinal(ordinal)
+        if day.weekday() not in weekdays or (month_day and day.day != month_day):
+            continue
+        midnight = datetime(day.year, day.month, day.day)
+        eligible_offsets = offsets
+        if every:
+            passed = (max(local_now, lower or local_now) - midnight).total_seconds()
+            skip = max(0, math.ceil((passed - offsets.start) / every))
+            eligible_offsets = offsets[skip:]
+        for offset in eligible_offsets:
+            if ordinal == date.max.toordinal() and offset >= 86400:
+                break
+            wall = midnight + timedelta(seconds=offset)
+            if upper and wall > upper:
+                return
+            if lower and wall < lower:
+                continue
+            instant = wall.replace(tzinfo=zone, fold=0).astimezone(timezone.utc)
+            if instant <= now or instant == last_instant or instant.astimezone(zone).replace(tzinfo=None) != wall:
+                continue
+            last_instant = instant
+            yield instant
+            found += 1
+            if found == limit:
+                return
+
+
+REMINDER_FIELDS = ("name", "at", "days", "zone", "action", "every_sec", "opens", "closes",
+                   "starts", "ends", "on_date", "month_day", "paused", "at_start", "id", "changed")
+REMINDER_COLUMNS = ", ".join(REMINDER_FIELDS)
+
+
+def reminder_store():
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    db = sqlite3.connect(DATA_DIR / "reminders.sqlite3")
+    try:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""CREATE TABLE IF NOT EXISTS reminders (
+                name TEXT PRIMARY KEY NOT NULL, at TEXT NOT NULL,
+                days TEXT NOT NULL, zone TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT 'notify'
+            )""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(reminders)")}
+            additions = {
+                "action": "TEXT NOT NULL DEFAULT 'notify'", "every_sec": "INTEGER",
+                "opens": "TEXT", "closes": "TEXT", "starts": "TEXT", "ends": "TEXT",
+                "on_date": "TEXT", "month_day": "INTEGER", "paused": "TEXT", "id": "TEXT",
+                "changed": "TEXT", "at_start": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in additions.items():
+                if column not in columns:
+                    db.execute(f"ALTER TABLE reminders ADD COLUMN {column} {definition}")
+            db.execute("UPDATE reminders SET id = lower(hex(randomblob(16))) WHERE id IS NULL")
+            db.execute("""CREATE TABLE IF NOT EXISTS reminder_history (
+                reminder_id TEXT NOT NULL, name TEXT NOT NULL, wall TEXT NOT NULL,
+                scheduled TEXT NOT NULL, attempted TEXT NOT NULL, action TEXT NOT NULL,
+                status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (reminder_id, wall)
+            )""")
+    except sqlite3.Error:
+        db.close()
+        raise
+    return db
+
+
+def show_reminder(rule, local, now, limit, compact=False):
+    name, at, days, policy, action, every, opens, closes, start, end, on_date, month_day, paused, at_start, _, _ = rule
+    zone = reminder_zone(policy, local)
+    zone_text = f"follows system ({local[1] or 'local time'})" if policy == "system" else f"{policy} (fixed)"
+    day_text = {"mon,tue,wed,thu,fri,sat,sun": "every day",
+                "mon,tue,wed,thu,fri": "weekdays", "sat,sun": "weekends"}.get(days, days)
+    cadence = f"Every {fmt_full_duration(every)}" if every else f"At {at}"
+    cadence = f"{cadence} · {on_date or (f'day {month_day} of each month' if month_day else day_text)}"
+    pause_text = ("paused until manually resumed" if paused == "manual" else
+                  f"paused until {datetime.fromisoformat(paused).astimezone(zone):%a %Y-%m-%d %H:%M %Z}"
+                  if paused and datetime.fromisoformat(paused) > now else "")
+    times = []
+    for instant in upcoming_reminders(rule, zone, now, limit):
+        scheduled = instant.astimezone(zone)
+        clock_format = "%H:%M:%S" if scheduled.second else "%H:%M"
+        date_format = f"%a %Y-%m-%d {clock_format} %Z"
+        line = scheduled.strftime(date_format)
+        if policy != "system" and policy != local[1]:
+            line += instant.astimezone(local[0]).strftime(f" ({date_format} system time)")
+        times.append(line)
+    if compact:
+        next_alert = c("36", times[0]) if times else "No upcoming alerts"
+        print(f"{c('1', name)}  {next_alert}  {c('2', cadence)}  {action}"
+              + (f"  ({pause_text})" if pause_text else ""))
+        return
+
+    print(f"  {c('1', 'Schedule')}   {cadence}")
+    if every:
+        rollover = " (ends next day)" if closes <= opens else ""
+        if closes == opens:
+            rollover = " (ends next day · 24-hour window)"
+        print(f"  {c('1', 'Window')}     {opens}–{closes}{rollover}")
+        if at_start:
+            print("             Includes a reminder when the window opens")
+    if start:
+        print(f"  {c('1', 'From')}       {start}")
+    if end:
+        print(f"  {c('1', 'Until')}      {end} (inclusive)")
+    print(f"  {c('1', 'Time zone')}  {zone_text}")
+    print(f"  {c('1', 'Action')}     {action}")
+    if pause_text:
+        print(f"  {c('1', 'Status')}     {pause_text}")
+    if times:
+        print(f"  {c('1', 'Next alert' if limit == 1 else 'Next alerts')}")
+        for line in times:
+            print(f"    {c('36', line)}")
+    else:
+        print("  No upcoming alerts.")
+
+
+def reminder_date(value):
+    normalized = reminder_boundary(value)
+    if len(normalized) != 10:
+        raise argparse.ArgumentTypeError("use a date without a time")
+    return normalized
+
+
+def month_day_number(value):
+    number = int(value)
+    if not 1 <= number <= 31:
+        raise argparse.ArgumentTypeError("use a day from 1 to 31")
+    return number
+
+
+def reminder_settings(args, existing, local, now):
+    values = dict(zip(REMINDER_FIELDS, existing)) if existing else dict.fromkeys(REMINDER_FIELDS)
+    values["name"] = args.name
+    if not existing:
+        values.update(at="", days=reminder_days("all"), zone="system", action="notify",
+                      at_start=0, id=uuid.uuid4().hex)
+    if args.at is not None:
+        values.update(at=args.at, every_sec=None, opens=None, closes=None, at_start=0)
+    if args.every is not None:
+        values.update(at="", every_sec=args.every)
+    if args.between:
+        values["opens"], values["closes"] = args.between
+    for field, value in (("starts", args.from_date), ("ends", args.until)):
+        if value is not None:
+            values[field] = value or None
+    if args.days or args.date or args.month_day:
+        values.update(days=args.days or reminder_days("all"), on_date=args.date, month_day=args.month_day)
+    if args.action:
+        values["action"] = args.action
+    if args.timezone:
+        policy = args.timezone
+        if policy == "local-fixed":
+            if not local[1]:
+                raise ValueError("Cannot identify the system time zone by name. Pass a named zone such as Asia/Kolkata.")
+            policy = local[1]
+        values["zone"] = policy
+    reminder_zone(values["zone"], local)
+    every, opens, closes = (values[key] for key in ("every_sec", "opens", "closes"))
+    if args.at_start is not None:
+        if args.at_start and not every:
+            raise ValueError("--at-start requires an interval reminder.")
+        values["at_start"] = int(args.at_start)
+    if bool(every) != bool(opens and closes):
+        raise ValueError("--every and --between must be used together.")
+    if every and every > window_length(opens, closes):
+        raise ValueError("--every cannot exceed the duration of the daily window.")
+    if values["on_date"] and every:
+        raise ValueError("--date requires a fixed --at time.")
+    lower = boundary_wall(values["starts"])
+    upper = boundary_wall(values["ends"], end=True)
+    if lower and upper and lower > upper:
+        raise ValueError("--from must be at or before --until.")
+    values["changed"] = now.isoformat()
+    return tuple(values[field] for field in REMINDER_FIELDS)
+
+
+def pause_expiry(args, zone, now):
+    wall = now.astimezone(zone).replace(tzinfo=None)
+    if args.duration:
+        duration = args.duration.strip()
+        duration = duration[:-1] + "mo" if duration.endswith("M") else duration.lower()
+        calendar_duration = re.fullmatch(r"([1-9][0-9]*)(d|mo)", duration)
+        if not calendar_duration:
+            return now + timedelta(seconds=positive_duration(duration))
+        count = int(calendar_duration[1])
+        if calendar_duration[2] == "d":
+            target = wall + timedelta(days=count)
+        else:
+            year, month = divmod(wall.year * 12 + wall.month - 1 + count, 12)
+            month += 1
+            target = wall.replace(year=year, month=month,
+                                  day=min(wall.day, calendar.monthrange(year, month)[1]))
+    elif args.until:
+        try:
+            clock = reminder_time(args.until)
+        except argparse.ArgumentTypeError:
+            target = boundary_wall(reminder_boundary(args.until))
+        else:
+            hour, minute = map(int, clock.split(":"))
+            target = wall.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            # A repeated hour can have a second upcoming instance of the requested time.
+            for day_offset in range(3):
+                candidate = target + timedelta(days=day_offset)
+                instants = sorted(candidate.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc)
+                                  for fold in (0, 1))
+                for instant in instants:
+                    if instant > now and instant.astimezone(zone).replace(tzinfo=None) == candidate:
+                        return instant
+            raise ValueError("Could not resolve the next local time. Pass a date and time.")
+    else:
+        return None
+    instant = target.replace(tzinfo=zone, fold=0).astimezone(timezone.utc)
+    if instant.astimezone(zone).replace(tzinfo=None) != target:
+        raise ValueError("Pause expiry is a nonexistent local time. Choose another time.")
+    if instant <= now:
+        raise ValueError("Pause expiry must be in the future.")
+    return instant
+
+
+def reminder_history(db, name, limit, zone):
+    query = "SELECT name, scheduled, attempted, action, status, detail FROM reminder_history"
+    params = ()
+    if name:
+        query += " WHERE name = ?"
+        params = (name,)
+    rows = db.execute(query + " ORDER BY attempted DESC LIMIT ?", (*params, limit)).fetchall()
+    if not rows:
+        print("No delivery history.")
+    for name, scheduled, attempted, action, status, detail in rows:
+        display = datetime.fromisoformat(scheduled).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+        print(f"{display}  {name}  {action}  {status}  attempted {attempted}"
+              + (f"  {detail}" if detail else ""))
+
+
+def cmd_remind(args):
+    command = args.reminder_cmd
+    database = DATA_DIR / "reminders.sqlite3"
+    try:
+        local = system_zone()
+        now = datetime.now(timezone.utc)
+        if not database.exists() and command in ("list", "log"):
+            print("No reminders yet." if command == "list" else "No delivery history.")
+            return
+        if not database.exists() and command != "add":
+            sys.exit(f"No reminder named {args.name!r}.")
+        with closing(reminder_store()) as db:
+            if command == "list":
+                rules = db.execute(f"SELECT {REMINDER_COLUMNS} FROM reminders ORDER BY name").fetchall()
+                if not rules:
+                    print("No reminders yet.")
+                for rule in rules:
+                    show_reminder(rule, local, now, 1, compact=True)
+                return
+            if command == "log":
+                reminder_history(db, args.name, args.limit, local[0])
+                return
+            with db:
+                if command != "show":
+                    db.execute("BEGIN IMMEDIATE")
+                rule = db.execute(f"SELECT {REMINDER_COLUMNS} FROM reminders WHERE name = ?",
+                                  (args.name,)).fetchone()
+                if rule is None and command != "add":
+                    sys.exit(f"No reminder named {args.name!r}.")
+                if command in ("add", "edit"):
+                    if command == "add" and rule is not None:
+                        sys.exit(f"A reminder named {args.name!r} already exists. Use tick remind edit.")
+                    rule = reminder_settings(args, rule, local, now)
+                    if command == "add":
+                        placeholders = ", ".join("?" for _ in REMINDER_FIELDS)
+                        db.execute(f"INSERT INTO reminders ({REMINDER_COLUMNS}) VALUES ({placeholders})", rule)
+                    else:
+                        assignments = ", ".join(f"{field} = ?" for field in REMINDER_FIELDS[1:])
+                        db.execute(f"UPDATE reminders SET {assignments} WHERE name = ?", (*rule[1:], args.name))
+                elif command == "remove":
+                    db.execute("DELETE FROM reminders WHERE name = ?", (args.name,))
+                elif command in ("pause", "resume"):
+                    paused = None
+                    if command == "pause":
+                        expiry = pause_expiry(args, reminder_zone(rule[3], local), now)
+                        paused = expiry.isoformat() if expiry else "manual"
+                    db.execute("UPDATE reminders SET paused = ?, changed = ? WHERE name = ?",
+                               (paused, now.isoformat(), args.name))
+                    rule = (*rule[:12], paused, *rule[13:-1], now.isoformat())
+            verbs = {"add": "Added", "edit": "Updated", "remove": "Removed", "pause": "Paused", "resume": "Resumed"}
+            print(c("1;32", f"{verbs[command]} {args.name}") if command in verbs else c("1", args.name))
+            if command != "remove":
+                show_reminder(rule, local, now, 3 if command == "show" else 1)
+            if command in ("add", "edit", "resume") and not reminder_scheduler_running():
+                print("Delivery is stopped. Run tick remind run or tick service start.")
+    except ZoneInfoNotFoundError as error:
+        sys.exit(f"Unknown time zone: {error.args[0]}")
+    except (OSError, sqlite3.Error, ValueError, OverflowError, argparse.ArgumentTypeError) as error:
+        sys.exit(f"Reminder error: {error}")
+
+
+def reminder_scheduler_running():
+    path = DATA_DIR / "reminder-scheduler.lock"
+    try:
+        with path.open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def deliver_reminder(args):
+    title = f"Reminder: {args.name}"
+    if args.action == "notify":
+        if not CFG["notify"] or not shutil.which("notify-send"):
+            sys.exit("Desktop notifications are disabled or notify-send is unavailable.")
+        result = subprocess.run(["notify-send", "-a", "tick", title], timeout=10)
+        if result.returncode:
+            sys.exit("Desktop notification failed.")
+        return
+
+    stop = threading.Event()
+    notification = _notify_persistent(title, "Scheduled reminder", stop, ("stop=Silence",))
+    sound = CFG["sound"] and find_sound()
+    if not notification["proc"] and not sound:
+        sys.exit("Neither the desktop notification nor alarm sound is available.")
+    deadline = time.monotonic() + (CFG["alert_max_sec"] or 60)
+    next_sound = 0
+    try:
+        while not stop.is_set() and time.monotonic() < deadline:
+            now = time.monotonic()
+            if sound and now >= next_sound:
+                play_sound()
+                next_sound = now + RING_EVERY
+            elif not sound and notification["proc"].poll() not in (None, 0):
+                break
+            stop.wait(0.2)
+    finally:
+        stop_sound()
+        _close_notification(notification)
+    if not notification["id"] and not stop.is_set() and not _SND.get("played"):
+        sys.exit("Alarm could not be dispatched to the desktop or audio player.")
+
+
+def finish_delivery(db, identity, status, detail=""):
+    with db:
+        db.execute("UPDATE reminder_history SET status = ?, detail = ? WHERE reminder_id = ? AND wall = ?",
+                   (status, detail, *identity))
+
+
+def launch_reminder(name, action):
+    return subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "remind", "_deliver", name, action],
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def dispatch_due_reminders(db, local, previous, now, pending):
+    rules = db.execute(f"SELECT {REMINDER_COLUMNS} FROM reminders").fetchall()
+    for rule in rules:
+        name, _, _, policy, action = rule[:5]
+        reminder_id, changed = rule[-2:]
+        after = max(previous, datetime.fromisoformat(changed)) if changed else previous
+        try:
+            zone = reminder_zone(policy, local)
+            due = next(upcoming_reminders(rule, zone, after, 1), None)
+            if due is None or due > now:
+                continue
+            wall = due.astimezone(zone).replace(tzinfo=None).isoformat()
+        except (ZoneInfoNotFoundError, ValueError, OverflowError) as error:
+            print(f"{name}: {error}", file=sys.stderr, flush=True)
+            continue
+        identity = reminder_id, wall
+        already_ringing = action == "alarm" and any(key[0] == reminder_id for key in pending)
+        status = "skipped" if already_ringing else "dispatching"
+        detail = "previous alarm still active" if already_ringing else ""
+        with db:
+            claim = db.execute(
+                """INSERT OR IGNORE INTO reminder_history
+                   (reminder_id, name, wall, scheduled, attempted, action, status, detail)
+                   SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                   WHERE EXISTS (SELECT 1 FROM reminders WHERE id = ? AND changed IS ?)""",
+                (reminder_id, name, wall, due.isoformat(), now.isoformat(), action, status,
+                 detail, reminder_id, changed),
+            )
+        if not claim.rowcount or already_ringing:
+            continue
+        try:
+            pending[identity] = launch_reminder(name, action)
+        except OSError as error:
+            finish_delivery(db, identity, "failed", str(error))
+
+
+def run_reminder_scheduler(_args):
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (DATA_DIR / "reminder-scheduler.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("A reminder scheduler is already running.")
+        stopping = threading.Event()
+        old_handler = signal.signal(signal.SIGTERM, lambda *_: stopping.set())
+        try:
+            with closing(reminder_store()) as db:
+                scheduler_loop(db, stopping)
+        finally:
+            signal.signal(signal.SIGTERM, old_handler)
+
+
+def scheduler_loop(db, stopping):
+    with db:
+        db.execute("""UPDATE reminder_history SET status = 'interrupted'
+                      WHERE status = 'dispatching'""")
+    print("tick reminder scheduler running", flush=True)
+    previous = datetime.now(timezone.utc)
+    previous_zone = None
+    previous_tick = time.monotonic()
+    pending = {}
+    try:
+        while not stopping.wait(0.5):
+            for identity, process in list(pending.items()):
+                result = process.poll()
+                if result is not None:
+                    detail = "" if result == 0 else f"delivery exited with status {result}"
+                    finish_delivery(db, identity, "dispatched" if result == 0 else "failed", detail)
+                    del pending[identity]
+            local = system_zone()
+            stat = Path("/etc/localtime").stat()
+            zone_key = (local[1], stat.st_ino, stat.st_mtime_ns)
+            now = datetime.now(timezone.utc)
+            tick = time.monotonic()
+            wall_delta = (now - previous).total_seconds()
+            if (previous_zone is None or zone_key == previous_zone) and 0 < wall_delta <= 3:
+                if abs(wall_delta - (tick - previous_tick)) <= 1:
+                    dispatch_due_reminders(db, local, previous, now, pending)
+            previous, previous_tick, previous_zone = now, tick, zone_key
+    finally:
+        for identity, process in pending.items():
+            if process.poll() is None:
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                finish_delivery(db, identity, "interrupted")
+            else:
+                status = "dispatched" if process.returncode == 0 else "failed"
+                finish_delivery(db, identity, status)
+
+
+def add_user_flag(parser):
+    parser.add_argument("--user", action="store_true", help="use your personal reminders (default)")
+
+
+SERVICE_NAME = "tick-reminders.service"
+
+
+def unit_quote(value, exec_arg=False):
+    value = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("\n", "\\n").replace("\r", "\\r")
+    if exec_arg:
+        value = value.replace("$", "$$")
+    return f'"{value}"'
+
+
+def service_unit():
+    command = " ".join(unit_quote(item, exec_arg=True) for item in
+                       (sys.executable, Path(__file__).resolve(), "remind", "run"))
+    lines = ["[Unit]", "Description=tick reminder scheduler", "", "[Service]",
+             f"ExecStart={command}", "Restart=on-failure", "RestartSec=2"]
+    for key in ("XDG_DATA_HOME", "XDG_CONFIG_HOME"):
+        if key in os.environ:
+            lines.append(f"Environment={unit_quote(key + '=' + os.environ[key])}")
+    lines.extend(("", "[Install]", "WantedBy=default.target", ""))
+    return "\n".join(lines)
+
+
+def cmd_service(args):
+    tool = shutil.which("systemctl")
+    if not tool:
+        sys.exit("systemctl is unavailable. Use tick remind run for reminders in the foreground.")
+    base = [tool, "--user"]
+    unit = CONF_DIR.parent / "systemd/user" / SERVICE_NAME
+    if args.service_cmd == "install":
+        content = service_unit()
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=unit.parent, delete=False) as output:
+            temporary = Path(output.name)
+            try:
+                output.write(content)
+                output.close()
+                temporary.chmod(0o644)
+                temporary.replace(unit)
+            finally:
+                temporary.unlink(missing_ok=True)
+        print(f"Installed {unit}")
+        result = subprocess.run([*base, "daemon-reload"]).returncode
+        if result:
+            sys.exit(result)
+        print("Run tick service start to enable it.")
+        return
+    if args.service_cmd in ("start", "restart") and not unit.exists():
+        sys.exit("Install the service first with tick service install.")
+    commands = {
+        "start": ["enable", "--now"], "stop": ["disable", "--now"],
+        "restart": ["restart"],
+        "status": ["--no-pager", "status"],
+    }
+    sys.exit(subprocess.run([*base, *commands[args.service_cmd], SERVICE_NAME]).returncode)
+
+
+def add_service_commands(sub):
+    service = sub.add_parser("service", help="manage background reminder delivery")
+    operations = service.add_subparsers(dest="service_cmd", metavar="{install,start,restart,stop,status}")
+    service.set_defaults(func=lambda args: service.print_help())
+    for verb, help_text in (
+        ("install", "write the systemd user service"),
+        ("start", "start delivery now and enable it at login"),
+        ("restart", "reload the scheduler after updating tick"),
+        ("stop", "stop delivery and disable it at login"),
+        ("status", "show scheduler service status"),
+    ):
+        parser = operations.add_parser(verb, help=help_text)
+        add_user_flag(parser)
+        parser.set_defaults(func=cmd_service)
+
+
+def reminder_name(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,63}", value) or value.endswith(" "):
+        raise argparse.ArgumentTypeError(
+            "use 1–64 letters, digits, spaces, hyphens, or underscores, starting with a letter or digit and without trailing spaces"
+        )
+    return value
+
+
+def add_reminder_commands(sub):
+    reminder = sub.add_parser(
+        "remind", help="schedule recurring reminders",
+        usage="tick remind <command> [options]",
+        help_rows=(("add <name>", "Save a fixed-time or interval reminder"),
+                   ("list", "List reminders and their next occurrence"),
+                   ("show <name>", "Preview the next three occurrences"),
+                   ("edit <name>", "Update an existing reminder"),
+                   ("pause <name>", "Pause indefinitely or until a deadline"),
+                   ("resume <name>", "Resume a paused reminder"),
+                   ("remove <name>", "Remove a reminder and keep its history"),
+                   ("log [name]", "Show recent delivery attempts"),
+                   ("run", "Run the scheduler in the foreground")),
+        examples=(("tick remind add water", "--at 9am --days weekdays --timezone system"),),
+    )
+    reminder.set_defaults(func=lambda args: reminder.print_help())
+    commands = reminder.add_subparsers(dest="reminder_cmd")
+    for verb in ("add", "edit"):
+        parser = commands.add_parser(
+            verb, description=f"{verb.capitalize()} a reminder and preview its next occurrence.",
+            formatter_class=argparse.RawTextHelpFormatter,
+        )
+        add_reminder_options(parser, editing=verb == "edit")
+    for verb in ("show", "remove", "pause", "resume"):
+        parser = commands.add_parser(verb)
+        parser.add_argument("name", type=reminder_name)
+        add_user_flag(parser)
+        parser.set_defaults(func=cmd_remind)
+        if verb == "pause":
+            expiry = parser.add_mutually_exclusive_group()
+            expiry.add_argument("--for", dest="duration", help="pause for a duration, e.g. 2h, 3d, or 1M (month)")
+            expiry.add_argument("--until", help="resume at a date and/or time in the reminder's zone")
+    log = commands.add_parser("log")
+    log.add_argument("name", nargs="?", type=reminder_name)
+    log.add_argument("-n", "--limit", type=positive_int, default=20)
+    add_user_flag(log)
+    log.set_defaults(func=cmd_remind)
+    listing = commands.add_parser("list")
+    add_user_flag(listing)
+    listing.set_defaults(func=cmd_remind)
+    run = commands.add_parser("run")
+    add_user_flag(run)
+    run.set_defaults(func=run_reminder_scheduler)
+    deliver = commands.add_parser("_deliver")
+    deliver.add_argument("name", type=reminder_name)
+    deliver.add_argument("action", choices=("notify", "alarm"))
+    deliver.set_defaults(func=deliver_reminder)
+
+
+def add_reminder_options(add, editing):
+    add.set_defaults(func=cmd_remind)
+    add_user_flag(add)
+    add.add_argument("name", type=reminder_name, help="unique reminder name, e.g. water")
+    schedule = add.add_mutually_exclusive_group(required=not editing)
+    schedule.add_argument("--at", type=reminder_time, help="fixed local time, e.g. 09:30 or 9:30am")
+    schedule.add_argument("--every", type=positive_duration, help="interval inside the daily window, e.g. 45m")
+    add.add_argument("--between", type=reminder_window, metavar="START-END",
+                     help="daily clock-time window for --every, e.g. 08:00-21:00")
+    first_alert = add.add_mutually_exclusive_group()
+    first_alert.add_argument("--at-start", action="store_true", default=None,
+                             help="also alert as soon as the daily window opens")
+    if editing:
+        first_alert.add_argument("--no-at-start", dest="at_start", action="store_false",
+                                 help="wait one interval before the first alert of each window")
+    start_bound = add.add_mutually_exclusive_group()
+    end_bound = add.add_mutually_exclusive_group()
+    start_bound.add_argument("--from", dest="from_date", type=reminder_boundary, metavar="DATE",
+                     help="first eligible date, optionally with a time")
+    end_bound.add_argument("--until", type=reminder_boundary, metavar="DATE",
+                     help="last eligible date, optionally with a time (inclusive)")
+    if editing:
+        start_bound.add_argument("--clear-from", dest="from_date", action="store_const", const="",
+                         help="remove the start boundary")
+        end_bound.add_argument("--clear-until", dest="until", action="store_const", const="",
+                         help="remove the end boundary")
+    days = add.add_mutually_exclusive_group()
+    days.add_argument("--date", type=reminder_date, help="run once on YYYY-MM-DD with --at")
+    days.add_argument("--month-day", type=month_day_number,
+                      help="repeat on this day of the month, skipping shorter months")
+    days.add_argument("--days", type=reminder_days,
+                     help="all (default), weekdays, weekends, or mon,wed,fri")
+    add.add_argument("--timezone", type=timezone_policy, metavar="ZONE",
+                     help=("system: follow system time zone changes (default)\n"
+                           "local-fixed: pin the current system time zone\n"
+                           "UTC or Asia/Kolkata: pin a named time zone"))
+    add.add_argument("--action", choices=("notify", "alarm"),
+                     help="notify: desktop notification (default)\n"
+                          "alarm: desktop notification with a ringing alert")
+
+
+class TickParser(argparse.ArgumentParser):
+    def __init__(self, *args, help_rows=(), examples=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.help_rows = help_rows
+        self.examples = examples
+
+    def format_help(self):
+        if not self.help_rows:
+            return super().format_help()
+        width = max(len(name) for name, _ in self.help_rows) + 2
+        commands = "\n".join(f"  {c('1;32', name.ljust(width))}{description}"
+                             for name, description in self.help_rows)
+        examples = "\n".join(f"  {c('1;36', command)} {options}"
+                             for command, options in self.examples)
+        arguments = self.usage.removeprefix(self.prog) if self.usage else " <command> [options]"
+        return f"""{c('1;34', 'Usage:')} {c('1;35', self.prog)}{arguments}
+
+{c('1;34', 'Commands')}
+{commands}
+
+{c('1;34', 'Examples')}
+{examples}
+
+{self.epilog or 'Run ' + c('1;36', self.prog + ' <command> --help') + ' for options.'}
+"""
+
+
+BASH_COMPLETION = r'''
+_tick_complete() {
+    local executable=${COMP_WORDS[0]} current=${COMP_WORDS[COMP_CWORD]}
+    local item attached=""
+    local -a preceding=("${COMP_WORDS[@]:1:COMP_CWORD-1}")
+    COMPREPLY=()
+    if (( ${#preceding[@]} )) && [[ $current == "=" || ${preceding[-1]} == "=" ]]; then
+        if [[ $current == '=' ]]; then
+            attached=${preceding[-1]}=
+            unset 'preceding[-1]'
+            current=""
+        else
+            unset 'preceding[-1]'
+            attached=${preceding[-1]}=
+            unset 'preceding[-1]'
+        fi
+        current=$attached$current
+    fi
+    while IFS= read -r item; do
+        COMPREPLY+=("${item#"$attached"}")
+    done < <("$executable" completion _candidates -- "$current" "${preceding[@]}")
+    if (( ${#COMPREPLY[@]} )); then
+        compopt -o filenames 2>/dev/null
+    fi
+}
+complete -o default -F _tick_complete tick
+'''
+
+ZSH_COMPLETION = r'''
+_tick_complete() {
+    local -a candidates preceding
+    preceding=("${words[@]:1:$((CURRENT - 2))}")
+    candidates=("${(@f)$("${words[1]}" completion _candidates -- "$PREFIX" "${preceding[@]}")}")
+    if (( ${#candidates[@]} )) && [[ -n ${candidates[1]} ]]; then
+        compadd -a candidates
+    else
+        _files
+    fi
+}
+compdef _tick_complete tick
+'''
+
+
+def personal_reminder_names():
+    path = DATA_DIR / "reminders.sqlite3"
+    if not path.is_file():
+        return ()
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                                     timeout=0.1)) as db:
+            return tuple(name for (name,) in db.execute("SELECT name FROM reminders ORDER BY name"))
+    except sqlite3.Error:
+        return ()
+
+
+def completion_values(action):
+    if action.choices is not None:
+        return tuple(str(value) for value in action.choices if not str(value).startswith("_"))
+    return {
+        "days": ("all", "weekdays", "weekends", *WEEKDAYS),
+        "timezone": ("system", "local-fixed", "UTC"),
+    }.get(action.dest, ())
+
+
+def completion_candidates(parser, current, words):
+    pending_value = None
+    positional_count = 0
+    positional_only = False
+    index = 0
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if word.startswith("--") and words[index:index + 1] == ["="]:
+            word += "=" + (words[index + 1] if index + 1 < len(words) else "")
+            index += 2
+        if pending_value:
+            pending_value = None
+            continue
+        if word == "--" and not positional_only:
+            positional_only = True
+            continue
+        if word.startswith("-") and not positional_only:
+            option, equals, _ = word.partition("=")
+            action = parser._option_string_actions.get(option)
+            if action is not None and action.nargs != 0 and not equals:
+                pending_value = action
+            continue
+        commands = next((action for action in parser._actions
+                         if isinstance(action, argparse._SubParsersAction)), None)
+        if commands is not None and word in commands.choices:
+            parser = commands.choices[word]
+            positional_count = 0
+        else:
+            positional_count += 1
+
+    if pending_value:
+        return completion_values(pending_value)
+    option, equals, _ = current.partition("=")
+    options = parser._option_string_actions
+    if equals and option in options and not positional_only:
+        return tuple(f"{option}={value}" for value in completion_values(options[option]))
+    if current.startswith("-") and not positional_only:
+        return tuple(flag for flag, action in options.items() if action.help != argparse.SUPPRESS)
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return tuple(name for name in action.choices if not name.startswith("_"))
+    positionals = [action for action in parser._actions if not action.option_strings]
+    if parser.prog == "tick completion" and words == ["completion", "install"]:
+        return ("bash", "zsh")
+    if positional_count < len(positionals):
+        action = positionals[positional_count]
+        if (action.type is reminder_name
+                and parser.prog.partition(" remind ")[2] in ("show", "edit", "pause", "resume", "remove", "log")):
+            return personal_reminder_names()
+        return completion_values(action)
+    return ()
+
+
+def install_completion(words):
+    shell = words[0] if words else Path(os.environ.get("SHELL", "")).name
+    if len(words) > 1 or shell not in ("bash", "zsh"):
+        sys.exit("Usage: tick completion install [bash|zsh]")
+    directory = Path(os.environ.get("ZDOTDIR") or Path.home()) if shell == "zsh" else Path.home()
+    rc = directory / f".{shell}rc"
+    source = f"source <(tick completion {shell})"
+    setup = [
+        "# tick shell completion",
+        "if command -v tick >/dev/null 2>&1; then",
+    ]
+    if shell == "zsh":
+        setup.append("    if ! (( $+functions[compdef] )); then autoload -Uz compinit; compinit; fi")
+    setup.extend((f"    {source}", "fi"))
+    try:
+        with rc.open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            stream.seek(0)
+            current = stream.read()
+            if source not in (line.strip() for line in current.splitlines()):
+                stream.write(("\n" if current else "") + "\n".join(setup) + "\n")
+                print(f"Installed {shell} completion in {rc}")
+            else:
+                print(f"{shell} completion is already configured in {rc}")
+    except (OSError, UnicodeError) as error:
+        sys.exit(f"Could not update {rc}: {error}")
+    print("Open a new shell to use Tab completion.")
+
+
+def cmd_completion(args, parser):
+    if args.shell == "install":
+        install_completion(args.words)
+        return
+    if args.shell in ("bash", "zsh"):
+        print(BASH_COMPLETION if args.shell == "bash" else ZSH_COMPLETION, end="")
+        return
+    if args.words:
+        current, *words = args.words
+        for match in completion_candidates(parser, current, words):
+            if match.startswith(current):
+                print(match)
+
+
+def release_file(path, ref, max_bytes):
+    url = f"https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{ref}/{path}"
+    try:
+        with urlopen(url, timeout=10) as response:
+            data = response.read(max_bytes + 1)
+    except HTTPError as error:
+        if error.code not in (401, 403, 404) or not shutil.which("gh"):
+            raise
+        endpoint = f"repos/{UPDATE_REPOSITORY}/contents/{path}?ref={ref}"
+        result = subprocess.run(["gh", "api", endpoint, "--jq", ".content"],
+                                capture_output=True, timeout=15)
+        if result.returncode:
+            raise ValueError("release is unavailable. For a private repository, log in to GitHub with gh first.") from None
+        data = base64.b64decode(b"".join(result.stdout.split()), validate=True)
+    if len(data) > max_bytes:
+        raise ValueError(f"{path} exceeds the download size limit")
+    return data
+
+
+def release_version(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", value):
+        raise ValueError("invalid release version")
+    return tuple(map(int, value.split(".")))
+
+
+def executable_version(source):
+    match = re.search(rb'^VERSION = "([0-9.]+)"$', source, re.MULTILINE)
+    if not match:
+        raise ValueError("installed executable has no version marker")
+    return match[1].decode("ascii")
+
+
+def replace_tick(path, source, mode):
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".tick-update-", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(source)
+            os.fchmod(output.fileno(), mode)
+            output.flush()
+            os.fsync(output.fileno())
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def install_tick_release(path, previous, payload, version):
+    service = shutil.which("systemctl")
+    command = [service, "--user"] if service else None
+    active = command and subprocess.run(
+        [*command, "is-active", "--quiet", SERVICE_NAME], timeout=10
+    ).returncode == 0
+    mode = stat.S_IMODE(path.stat().st_mode)
+    replace_tick(path, payload, mode)
+    if active:
+        try:
+            subprocess.run([*command, "restart", SERVICE_NAME], check=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as error:
+            replace_tick(path, previous, mode)
+            try:
+                subprocess.run([*command, "restart", SERVICE_NAME], check=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                raise ValueError("restored the previous executable, but the reminder service did not restart") from error
+            raise ValueError("restart failed, so the previous version was restored and restarted") from error
+    print(f"Updated tick to {version}." + (" Reminder service restarted." if active else ""))
+
+
+def cmd_update(_args):
+    path = Path(__file__).resolve()
+    try:
+        DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (DATA_DIR / "update.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            previous = path.read_bytes()
+            installed = executable_version(previous)
+            metadata = json.loads(release_file("release.json", "main", 4096))
+            if not isinstance(metadata, dict):
+                raise ValueError("invalid release metadata")
+            version = metadata.get("version")
+            if release_version(version) <= release_version(installed):
+                print(f"tick {installed} is up to date.")
+                return
+            checksum = metadata.get("sha256")
+            if not isinstance(checksum, str) or not re.fullmatch(r"[a-f0-9]{64}", checksum):
+                raise ValueError("invalid release checksum")
+            payload = release_file("tick", f"v{version}", 2 * 1024 * 1024)
+            if hashlib.sha256(payload).hexdigest() != checksum:
+                raise ValueError("release checksum does not match")
+            if executable_version(payload) != version:
+                raise ValueError("release executable version does not match")
+            compile(payload, str(path), "exec")
+            install_tick_release(path, previous, payload, version)
+    except BlockingIOError:
+        sys.exit("Another tick update is already running.")
+    except (OSError, ValueError, SyntaxError, subprocess.SubprocessError) as error:
+        sys.exit(f"Update failed: {error}")
+
+
+def main():
+    p = TickParser(
+        prog="tick", usage="tick <command> [options]",
+        help_rows=(
+            ("timer <duration>", "Count down and alert when done"),
+            ("sw", "Run a stopwatch"),
+            ("pomo", "Alternate focus and breaks"),
+            ("study", "Record sessions and view study stats"),
+            ("remind", "Manage scheduled reminders"),
+            ("service", "Manage background reminder delivery"),
+            ("completion", "Generate shell Tab completion"),
+            ("update", "Install the latest release and restart an active reminder service"),
+            ("config", "Show or change shared settings"),
+            ("sound", "Test and diagnose the alert sound"),
+        ),
+        examples=(("tick timer", '5m --label "Check the oven"'),
+                  ("tick study pomo", "-s SQL")),
+    )
+    p.add_argument("--version", action="version", version=f"tick {VERSION}")
+    sub = p.add_subparsers(dest="mode")
+    add_timer_commands(sub, study=False)
+    add_reminder_commands(sub)
+    add_service_commands(sub)
+    sub.add_parser("update").set_defaults(func=cmd_update)
+    add_shared_commands(sub)
+    completion = sub.add_parser(
+        "completion", help="set up shell Tab completion",
+        usage="tick completion <command> [shell]",
+        epilog="After installing, open a new shell to use Tab completion.",
+        help_rows=(
+            ("install", "Install for Bash or Zsh based on $SHELL"),
+            ("install bash|zsh", "Install for a specific shell"),
+            ("bash", "Print the Bash completion script"),
+            ("zsh", "Print the Zsh completion script"),
+        ),
+        examples=(("tick completion", "install"),
+                  ("tick completion", "install bash")),
+    )
+    completion.add_argument("shell", choices=("bash", "zsh", "install", "_candidates"),
+                            metavar="{bash,zsh,install}")
+    completion.add_argument("words", nargs="*", help=argparse.SUPPRESS)
+    completion.set_defaults(func=lambda args: cmd_completion(args, p))
+    study_parser = sub.add_parser(
+        "study", prog="tick study", usage="tick study <command> [options]",
+        help="time and record study sessions",
+        help_rows=(
+            ("timer <duration>", "Count down and record study time"),
+            ("sw", "Record study time with a stopwatch"),
+            ("pomo", "Record Pomodoro focus rounds"),
+            ("stats", "Show study progress and streaks"),
+            ("log", "List recent study sessions"),
+            ("goal [duration]", "Show or set the daily study goal"),
+        ),
+        examples=(("tick study pomo", "-s SQL"),
+                  ("tick study stats", "--days 14")),
+    )
+    add_study_commands(study_parser)
+
+    a = p.parse_args()
+    if not hasattr(a, "func"):
+        if a.mode == "study":
+            a = study_parser.parse_args(["pomo"])
+        else:
+            p.print_help()
+            return
+
+    if getattr(a, "sound", None):
+        CFG["sound_file"] = a.sound
+        CFG["sound"] = True
+    if getattr(a, "mute", False):
+        CFG["sound"] = CFG["bell"] = False
+    try:
+        a.func(a)
+    except KeyboardInterrupt:
+        print()
+        stop_sound()
+    finally:
+        drain_sound()
+
+
+if __name__ == "__main__":
+    main()
