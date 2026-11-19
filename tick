@@ -27,13 +27,14 @@ import wave
 import tty
 from collections import defaultdict
 from contextlib import closing
+from copy import copy
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 UPDATE_REPOSITORY = "stashforge/tick"
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "studytimer"
@@ -118,7 +119,7 @@ def today_seconds():
     return sum(s["seconds"] for s in load_sessions() if s["start"][:10] == t)
 
 
-def record(start, secs, subject, kind, completed):
+def record(start, secs, subject, kind, completed, target=None):
     """Append a focus session to the log. Ignores anything under a minute."""
     if secs < 60:
         return 0
@@ -132,6 +133,8 @@ def record(start, secs, subject, kind, completed):
         "kind": kind,
         "completed": completed,
     }
+    if target is not None:
+        rec["target_seconds"] = target
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(rec) + "\n")
     goal = CFG["goal_min"] * 60
@@ -564,7 +567,7 @@ def post_notification(title, body):
     if shutil.which("termux-notification"):
         command = ["termux-notification", "--title", title, "--content", body]
     elif shutil.which("notify-send"):
-        command = ["notify-send", "-a", "tick", title, body]
+        command = ["notify-send", "-a", "tick", "--", title, body]
     else:
         return
     try:
@@ -594,7 +597,7 @@ def _notify_persistent(title, body, stop, actions=("stop=Stop",)):
     try:
         p = subprocess.Popen(
             ["notify-send", "-a", "tick", "-u", "critical", "--print-id",
-             *[f"--action={action}" for action in actions], "--wait", title, body],
+             *[f"--action={action}" for action in actions], "--wait", "--", title, body],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     except OSError:
         return h
@@ -753,7 +756,7 @@ def progress_rule(width, fraction, color):
 
 
 def run_phase(keys, label, target, color, count_up=False, can_skip=False):
-    """Return elapsed seconds, outcome, and seconds left."""
+    """Return elapsed seconds, outcome, seconds left, and the final target."""
     elapsed, paused = 0.0, False
     last = time.monotonic()
     outcome = "quit"
@@ -797,7 +800,7 @@ def run_phase(keys, label, target, color, count_up=False, can_skip=False):
                       clock=(artwork_clock, clock_style), total=total,
                       fraction=fraction, state=details)
             if not count_up and elapsed >= target:
-                return int(target), "done", 0
+                return int(target), "done", 0, int(target)
 
             k = keys.get(0.2)
             # Charge the interval before processing a pause, stop, or edit.
@@ -806,7 +809,7 @@ def run_phase(keys, label, target, color, count_up=False, can_skip=False):
                 elapsed += now - last
             last = now
             if not count_up and elapsed >= target:
-                return int(target), "done", 0
+                return int(target), "done", 0, int(target)
             if k == "m":
                 stop_sound()
             elif k == "c":
@@ -827,7 +830,7 @@ def run_phase(keys, label, target, color, count_up=False, can_skip=False):
                 target = max(elapsed, target - 60)
     except KeyboardInterrupt:
         pass
-    return int(elapsed), outcome, max(0, math.ceil(target - elapsed))
+    return int(elapsed), outcome, max(0, math.ceil(target - elapsed)), None if count_up else int(target)
 
 
 def wait_next(keys, prompt, alert=None):
@@ -924,11 +927,11 @@ def cmd_pomo(a):
             rounds += 1
             start = datetime.now()
             round_label = f"{rounds}/{a.rounds}" if a.rounds else str(rounds)
-            secs, why, _ = run_phase(keys, f"Focus {round_label}",
+            secs, why, _, target = run_phase(keys, f"Focus {round_label}",
                                      work, "33", can_skip=True)
             total += secs
             if a.study:
-                logged += record(start, secs, a.subject, "pomodoro", why == "done")
+                logged += record(start, secs, a.subject, "pomodoro", why == "done", target)
             final = bool(a.rounds and rounds >= a.rounds)
             if why == "done" and final and CFG["ring"]:
                 ring(keys, "Focus done", "All rounds complete.")
@@ -942,7 +945,7 @@ def cmd_pomo(a):
                     keys, "Start break",
                     alert=("Focus done", "Time for a break") if why == "done" else None):
                 break
-            secs, why, _ = run_phase(keys, "Long break" if is_long else "Break",
+            secs, why, _, _ = run_phase(keys, "Long break" if is_long else "Break",
                                      brk, "32", can_skip=True)
             if why == "done" and auto:
                 notify("Break over", keys.alert_body("Back to focus."))
@@ -961,7 +964,7 @@ def cmd_pomo(a):
 def cmd_stopwatch(a):
     start = datetime.now()
     with Keys(a) as keys:
-        secs, why, _ = run_phase(keys, "Stopwatch", 0, "36", count_up=True)
+        secs, why, _, _ = run_phase(keys, "Stopwatch", 0, "36", count_up=True)
     got = record(start, secs, a.subject, "stopwatch", why != "skip") if a.study else None
     print_elapsed(a, secs, got, why)
 
@@ -969,8 +972,8 @@ def cmd_stopwatch(a):
 def cmd_timer(a):
     start = datetime.now()
     with Keys(a) as keys:
-        secs, why, left = run_phase(keys, "Timer", a.duration, "34")
-        got = record(start, secs, a.subject, "timer", why == "done") if a.study else None
+        secs, why, left, target = run_phase(keys, "Timer", a.duration, "34")
+        got = record(start, secs, a.subject, "timer", why == "done", target) if a.study else None
         if why == "done":
             if CFG["ring"]:
                 ring(keys, "Timer finished", f"{fmt_dur(secs)} done.")
@@ -996,61 +999,198 @@ def print_elapsed(args, secs, logged, why="quit", left=0):
     print(summary)
 
 
+def study_bar(studied, target, width):
+    filled = round(width * min(studied, target) / target)
+    if studied and not filled:
+        filled = 1
+    return c("36", "█" * filled) + c("2;90", "░" * (width - filled))
+
+
 def cmd_stats(a):
     sessions = load_sessions()
+    if a.date:
+        sessions = [session for session in sessions if session["start"][:10] == a.date]
+        if not sessions:
+            print(f"No study sessions on {a.date}.")
+            return
     if not sessions:
         print("No sessions yet. Run `tick study` to start one.")
         return
-    by_day, by_subj = defaultdict(int), defaultdict(int)
+    by_day, by_subj, targets, untargeted = defaultdict(int), defaultdict(int), defaultdict(int), set()
+    estimated = set()
+    session_counts = defaultdict(int)
     today = date.today()
-    cutoff = (today - timedelta(days=a.days - 1)).isoformat()
-    for s in sessions:
-        d = s["start"][:10]
-        by_day[d] += s["seconds"]
-        if d >= cutoff:
-            by_subj[s["subject"] or "(none)"] += s["seconds"]
+    days = ([date.fromisoformat(a.date)] if a.date else
+            [today - timedelta(days=i) for i in range(a.days - 1, -1, -1)])
+    cutoff, last_day = days[0].isoformat(), days[-1].isoformat()
+    today_key = today.isoformat()
+    for session in sessions:
+        day = session["start"][:10]
+        by_day[day] += session["seconds"]
+        session_counts[day] += 1
+        target = session.get("target_seconds")
+        if target is None:
+            untargeted.add(day)
+        else:
+            targets[day] += target
+            if session.get("target_estimated"):
+                estimated.add(day)
+        if cutoff <= day <= last_day:
+            by_subj[session["subject"] or "No subject"] += session["seconds"]
 
-    goal = CFG["goal_min"] * 60
-    t = by_day.get(today.isoformat(), 0)
-    line = f"Today  {c('1', fmt_dur(t))}"
-    if goal:
-        pct = min(1.0, t / goal)
-        line += f"  [{c('32', '█' * int(20 * pct))}{'░' * (20 - int(20 * pct))}] {int(pct * 100)}% of {fmt_dur(goal)}"
-    print(line)
+    width = shutil.get_terminal_size((80, 24)).columns
+    if a.date:
+        count = len(sessions)
+        print(c("1", f"{a.date} · {count} {'session' if count == 1 else 'sessions'}"))
+    else:
+        goal = CFG["goal_min"] * 60
+        studied_today = by_day[today_key]
+        print(c("1", "Today"))
+        if goal:
+            left, right = fmt_dur(studied_today), f"{fmt_dur(goal)} goal"
+            bar_width = min(24, width - len(left) - len(right) - 8)
+            bar = study_bar(studied_today, goal, bar_width) if bar_width >= 4 else ""
+            pct = studied_today * 100 // goal
+            print(f"  {c('1', left)}  {bar + '  ' if bar else ''}{right}  {pct}%")
+        else:
+            print(f"  Studied  {fmt_dur(studied_today)}")
 
-    print(f"\nLast {a.days} days")
-    days = [(today - timedelta(days=i)) for i in range(a.days - 1, -1, -1)]
-    mx = max([by_day.get(d.isoformat(), 0) for d in days] + [1])
-    for d in days:
-        v = by_day.get(d.isoformat(), 0)
-        bar = "█" * round(24 * v / mx)
-        print(f"  {d.strftime('%a %d')}  {c('36', bar):<{24 + (9 if USE_COLOR else 0)}} {fmt_dur(v) if v else ''}")
+        print(f"\n{c('1', f'Last {a.days} days')}")
+    rows = []
+    for day in days:
+        key = day.isoformat()
+        studied = by_day[key]
+        target = targets.get(key)
+        partial = target is not None and key in untargeted
+        rows.append((day, studied, target, partial))
+    lefts = [fmt_dur(studied) if studied else "—" for _, studied, _, _ in rows]
+    rights = [("~" if day.isoformat() in estimated else "") + fmt_dur(target) + ("*" if partial else "")
+              if target is not None else "—" for day, _, target, partial in rows]
+    left_width = max(len("Studied"), *map(len, lefts))
+    right_width = max(len("Target"), *map(len, rights))
+    labels = [day.strftime("%a %d") for day in days]
+    label_width = max(sum(map(cell_width, label)) for label in labels)
+    count_width = max(len("Sessions"), *(len(str(session_counts[day.isoformat()])) for day in days))
+    available = width - label_width - left_width - right_width - 9
+    show_counts = not a.date and available >= count_width + 6
+    bar_width = min(24, available - (count_width + 2 if show_counts else 0))
+
+    def print_day(label, left, right, bar="", count="", heading=False):
+        suffix = f"  {count:>{count_width}}" if show_counts else ""
+        line = (f"  {label}   {left:>{left_width}}  "
+                f"{bar + '  ' if bar else ''}{right:>{right_width}}{suffix}")
+        print(c("38;5;240", line) if heading else line)
+
+    print_day(" " * label_width, "Studied", "Target",
+              " " * bar_width if bar_width >= 4 else "", "Sessions", heading=True)
+    for (day, studied, target, partial), label, left, right in zip(rows, labels, lefts, rights):
+        bar = ""
+        if bar_width >= 4:
+            if target and not partial:
+                bar = study_bar(studied, target, bar_width)
+            else:
+                bar = " " * bar_width if studied else c("2;90", "░" * bar_width)
+        # The label is padded before applying color so escape sequences do not count as columns.
+        label = c("1" if day == today else "2;39",
+                  label + " " * (label_width - sum(map(cell_width, label))))
+        count = session_counts[day.isoformat()]
+        count_text = str(count) if count else "—"
+        if show_counts and count > 1:
+            count_text = c("1", count_text.rjust(count_width))
+        print_day(label, left, right, bar, count_text)
+        if not a.date and not show_counts and count > 1:
+            print(f"    {count} sessions")
+    if any(day.isoformat() in estimated for day in days):
+        print("  ~ Includes an estimated target.")
+    if any(partial for _, _, _, partial in rows):
+        print("  * Only some sessions have a target.")
 
     if by_subj:
-        print(f"\nSubjects (last {a.days} days)")
-        for name, v in sorted(by_subj.items(), key=lambda x: -x[1]):
-            print(f"  {name:<20} {fmt_dur(v)}")
+        heading = "Subjects" if a.date else f"Subjects · Last {a.days} days"
+        print(f"\n{c('1', heading)}")
+        subjects = [(name, fmt_dur(duration))
+                    for name, duration in sorted(by_subj.items(), key=lambda item: -item[1])]
+        duration_width = max(len(duration) for _, duration in subjects)
+        label_width = max(1, min(24, width - duration_width - 4))
+        for name, duration in subjects:
+            label = wrap_label(name, label_width, 1)[0]
+            pad = " " * (label_width - sum(map(cell_width, label)))
+            print(f"  {styled_line(((label, '39'),), label_width)}{pad}  {duration:>{duration_width}}")
 
-    streak, d = 0, today
-    if by_day.get(d.isoformat(), 0) == 0:
-        d -= timedelta(days=1)
-    while by_day.get(d.isoformat(), 0) > 0:
+    if a.date:
+        print()
+        print_study_sessions(sorted(sessions, key=lambda item: item["start"], reverse=True), "Sessions")
+        return
+
+    streak, day = 0, today
+    if by_day.get(today_key, 0) == 0:
+        day -= timedelta(days=1)
+    while by_day.get(day.isoformat(), 0) > 0:
         streak += 1
-        d -= timedelta(days=1)
-    best_day, best = max(by_day.items(), key=lambda x: x[1])
-    print(f"\nStreak {streak} day(s) · best day {fmt_dur(best)} ({best_day}) · "
-          f"all-time {fmt_dur(sum(by_day.values()))} over {len(sessions)} sessions")
+        day -= timedelta(days=1)
+    best_day, best = max(by_day.items(), key=lambda item: item[1])
+    print(f"\n{c('1', 'All time')}")
+    print(f"  Total           {fmt_dur(sum(by_day.values()))} across {len(sessions)} sessions")
+    print(f"  Current streak  {streak} {'day' if streak == 1 else 'days'}")
+    print(f"  Best day        {fmt_dur(best)} on {best_day}")
 
 
 def cmd_log(a):
-    sessions = load_sessions()[-a.n:] if a.n else []
+    sessions = load_sessions()
+    if a.date:
+        sessions = [session for session in sessions if session["start"][:10] == a.date]
+    limit = a.n if a.n is not None else (None if a.date else 10)
+    sessions = sorted(sessions, key=lambda item: item["start"], reverse=True)[:limit]
     if not sessions:
-        print("No sessions yet.")
+        print(f"No study sessions on {a.date}." if a.date else "No sessions yet.")
         return
-    for s in sessions:
-        mark = "✓" if s.get("completed") else "·"
-        print(f"{s['start'].replace('T', ' ')[:16]}  {fmt_dur(s['seconds']):>7}  "
-              f"{s['kind']:<9} {mark}  {s['subject']}")
+    print_study_sessions(sessions, f"Sessions on {a.date}" if a.date else "Recent sessions")
+
+
+def print_study_sessions(sessions, heading):
+    width = shutil.get_terminal_size((80, 24)).columns
+    rows = []
+    for session in sessions:
+        start = session["start"]
+        target = session.get("target_seconds")
+        target_text = fmt_dur(target) if target is not None else "—"
+        if target is not None and session.get("target_estimated"):
+            target_text = "~" + target_text
+        rows.append((start[:10], start[11:16], fmt_dur(session["seconds"]),
+                     target_text, session["kind"].title(),
+                     session["subject"] or "—", "Complete" if session.get("completed") else "Partial"))
+    headers = ("Date", "Time", "Studied", "Target", "Mode", "Subject", "Status")
+    widths = [max(len(header), max(len(row[i]) for row in rows)) for i, header in enumerate(headers)]
+    subject_width = width - sum(size for i, size in enumerate(widths) if i != 5) - 12
+    print(c("1", heading))
+    if subject_width < len("Subject"):
+        print(c("38;5;240", "  Studied / Target"))
+        for day, clock, studied, target, mode, subject, status in rows:
+            print(f"{c('2;39', f'{day} {clock}')}  {c('32' if status == 'Complete' else '33', status)}")
+            print(f"  {studied} / {target}  {mode}")
+            if subject != "—":
+                for line in wrap_label(subject, max(1, width - 2), 2):
+                    print(styled_line((("  " + line, "39"),), width))
+        return
+
+    widths[5] = min(subject_width, max(len("Subject"), max(sum(map(cell_width, row[5])) for row in rows)))
+
+    def format_row(row, heading=False):
+        cells = []
+        for i, (value, size) in enumerate(zip(row, widths)):
+            if i == 5:
+                value = wrap_label(value, size, 1)[0]
+            padding = " " * (size - sum(map(cell_width, value)))
+            text = padding + value if i in (2, 3) else value + (padding if i < 6 else "")
+            style = "38;5;240" if heading else "2;39" if i in (0, 1) else "39"
+            if not heading and i == 6:
+                style = "32" if value == "Complete" else "33"
+            cells.append(styled_line(((text, style),), size))
+        return "  ".join(cells)
+
+    print(format_row(headers, heading=True))
+    for row in rows:
+        print(format_row(row))
 
 
 def cmd_sound(a):
@@ -1173,11 +1313,16 @@ def add_study_commands(p):
     sub = p.add_subparsers(dest="cmd")
     add_timer_commands(sub, study=True)
     s = sub.add_parser("stats", help="progress and streaks")
-    s.add_argument("-d", "--days", type=positive_int, default=7)
+    period = s.add_mutually_exclusive_group()
+    period.add_argument("-d", "--days", type=positive_int, default=7,
+                        help="number of days to show (default: 7)")
+    period.add_argument("--date", type=calendar_date, help="summarize one date, YYYY-MM-DD")
     s.set_defaults(func=cmd_stats)
 
     s = sub.add_parser("log", help="recent sessions")
-    s.add_argument("-n", type=nonnegative_int, default=10)
+    s.add_argument("--date", type=calendar_date, help="show sessions from one date, YYYY-MM-DD")
+    s.add_argument("-n", type=nonnegative_int,
+                   help="limit how many sessions to show (default: 10, or all with --date)")
     s.set_defaults(func=cmd_log)
 
     s = sub.add_parser("goal", help="show/set daily goal")
@@ -1286,7 +1431,7 @@ def window_length(start, end):
 
 
 def upcoming_reminders(rule, zone, now, limit):
-    _, at, days, _, _, every, opens, closes, start, end, on_date, month_day, paused, at_start, _, _ = rule
+    _, at, days, _, _, every, opens, closes, start, end, on_date, month_day, paused, at_start, _, _, _ = rule
     if paused == "manual":
         return
     if paused:
@@ -1339,7 +1484,7 @@ def upcoming_reminders(rule, zone, now, limit):
 
 
 REMINDER_FIELDS = ("name", "at", "days", "zone", "action", "every_sec", "opens", "closes",
-                   "starts", "ends", "on_date", "month_day", "paused", "at_start", "id", "changed")
+                   "starts", "ends", "on_date", "month_day", "paused", "at_start", "description", "id", "changed")
 REMINDER_COLUMNS = ", ".join(REMINDER_FIELDS)
 
 
@@ -1360,6 +1505,7 @@ def reminder_store():
                 "opens": "TEXT", "closes": "TEXT", "starts": "TEXT", "ends": "TEXT",
                 "on_date": "TEXT", "month_day": "INTEGER", "paused": "TEXT", "id": "TEXT",
                 "changed": "TEXT", "at_start": "INTEGER NOT NULL DEFAULT 0",
+                "description": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in additions.items():
                 if column not in columns:
@@ -1378,7 +1524,7 @@ def reminder_store():
 
 
 def show_reminder(rule, local, now, limit, compact=False):
-    name, at, days, policy, action, every, opens, closes, start, end, on_date, month_day, paused, at_start, _, _ = rule
+    name, at, days, policy, action, every, opens, closes, start, end, on_date, month_day, paused, at_start, description, _, _ = rule
     zone = reminder_zone(policy, local)
     zone_text = f"follows system ({local[1] or 'local time'})" if policy == "system" else f"{policy} (fixed)"
     day_text = {"mon,tue,wed,thu,fri,sat,sun": "every day",
@@ -1403,6 +1549,12 @@ def show_reminder(rule, local, now, limit, compact=False):
               + (f"  ({pause_text})" if pause_text else ""))
         return
 
+    if description:
+        print(f"  {c('1', 'Description')}")
+        width = max(1, shutil.get_terminal_size((80, 24)).columns - 4)
+        for paragraph in description.splitlines():
+            for line in textwrap.wrap(paragraph, width) or [""]:
+                print("    " + styled_line(((line, "39"),), width))
     print(f"  {c('1', 'Schedule')}   {cadence}")
     if every:
         rollover = " (ends next day)" if closes <= opens else ""
@@ -1427,7 +1579,7 @@ def show_reminder(rule, local, now, limit, compact=False):
         print("  No upcoming alerts.")
 
 
-def reminder_date(value):
+def calendar_date(value):
     normalized = reminder_boundary(value)
     if len(normalized) != 10:
         raise argparse.ArgumentTypeError("use a date without a time")
@@ -1446,7 +1598,7 @@ def reminder_settings(args, existing, local, now):
     values["name"] = args.name
     if not existing:
         values.update(at="", days=reminder_days("all"), zone="system", action="notify",
-                      at_start=0, id=uuid.uuid4().hex)
+                      at_start=0, description="", id=uuid.uuid4().hex)
     if args.at is not None:
         values.update(at=args.at, every_sec=None, opens=None, closes=None, at_start=0)
     if args.every is not None:
@@ -1460,6 +1612,8 @@ def reminder_settings(args, existing, local, now):
         values.update(days=args.days or reminder_days("all"), on_date=args.date, month_day=args.month_day)
     if args.action:
         values["action"] = args.action
+    if args.description is not None:
+        values["description"] = args.description
     if args.timezone:
         policy = args.timezone
         if policy == "local-fixed":
@@ -1568,11 +1722,11 @@ def cmd_remind(args):
                 reminder_history(db, args.name, args.limit, local[0])
                 return
             if command == "test":
-                row = db.execute("SELECT action FROM reminders WHERE name = ?", (args.name,)).fetchone()
+                row = db.execute("SELECT action, description FROM reminders WHERE name = ?", (args.name,)).fetchone()
                 if row is None:
                     sys.exit(f"No reminder named {args.name!r}.")
                 print(f"Testing {args.name} ({row[0]}).", flush=True)
-                result = launch_reminder(args.name, row[0])
+                result = launch_reminder(args.name, *row)
                 try:
                     status = result.wait()
                 except KeyboardInterrupt:
@@ -1636,16 +1790,20 @@ def reminder_scheduler_running():
 
 def deliver_reminder(args):
     title = f"Reminder: {args.name}"
+    description = args.description
     if args.action == "notify":
         if not CFG["notify"] or not shutil.which("notify-send"):
             sys.exit("Desktop notifications are disabled or notify-send is unavailable.")
-        result = subprocess.run(["notify-send", "-a", "tick", title], timeout=10)
+        command = ["notify-send", "-a", "tick", "--", title]
+        if description:
+            command.append(description)
+        result = subprocess.run(command, timeout=10)
         if result.returncode:
             sys.exit("Desktop notification failed.")
         return
 
     stop = threading.Event()
-    notification = _notify_persistent(title, "Scheduled reminder", stop, ("stop=Silence",))
+    notification = _notify_persistent(title, description or "Scheduled reminder", stop, ("stop=Silence",))
     sound = CFG["sound"] and find_sound()
     if not notification["proc"] and not sound:
         sys.exit("Neither the desktop notification nor alarm sound is available.")
@@ -1673,9 +1831,10 @@ def finish_delivery(db, identity, status, detail=""):
                    (status, detail, *identity))
 
 
-def launch_reminder(name, action):
+def launch_reminder(name, action, description):
     return subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "remind", "_deliver", name, action],
+        [sys.executable, str(Path(__file__).resolve()), "remind", "_deliver", name, action,
+         f"--description={description}"],
         stdin=subprocess.DEVNULL,
     )
 
@@ -1687,7 +1846,7 @@ def dispatch_due_reminders(db, local, previous, now, pending, rules=None, next_d
         next_due = {}
     for rule in rules:
         name, _, _, policy, action = rule[:5]
-        reminder_id, changed = rule[-2:]
+        description, reminder_id, changed = rule[-3:]
         try:
             if reminder_id not in next_due:
                 after = max(previous, datetime.fromisoformat(changed)) if changed else previous
@@ -1726,7 +1885,7 @@ def dispatch_due_reminders(db, local, previous, now, pending, rules=None, next_d
         if not claim.rowcount or already_ringing:
             continue
         try:
-            pending[identity] = launch_reminder(name, action)
+            pending[identity] = launch_reminder(name, action, description)
         except OSError as error:
             finish_delivery(db, identity, "failed", str(error))
 
@@ -1902,7 +2061,6 @@ def add_reminder_commands(sub):
     for verb in ("add", "edit"):
         parser = commands.add_parser(
             verb, description=f"{verb.capitalize()} a reminder and preview its next occurrence.",
-            formatter_class=argparse.RawTextHelpFormatter,
         )
         add_reminder_options(parser, editing=verb == "edit")
     for verb in ("show", "remove", "pause", "resume", "test"):
@@ -1915,7 +2073,8 @@ def add_reminder_commands(sub):
             expiry.add_argument("--until", help="resume at a date and/or time in the reminder's zone")
     log = commands.add_parser("log")
     log.add_argument("name", nargs="?", type=reminder_name)
-    log.add_argument("-n", "--limit", type=positive_int, default=20)
+    log.add_argument("-n", "--limit", type=positive_int, default=20,
+                     help="number of delivery attempts to show (default: 20)")
     log.set_defaults(func=cmd_remind)
     listing = commands.add_parser("list")
     listing.set_defaults(func=cmd_remind)
@@ -1924,6 +2083,7 @@ def add_reminder_commands(sub):
     deliver = commands.add_parser("_deliver")
     deliver.add_argument("name", type=reminder_name)
     deliver.add_argument("action", choices=("notify", "alarm"))
+    deliver.add_argument("--description", default="")
     deliver.set_defaults(func=deliver_reminder)
 
 
@@ -1934,7 +2094,7 @@ def add_reminder_options(add, editing):
     schedule.add_argument("--at", type=reminder_time, help="fixed local time, e.g. 09:30 or 9:30am")
     schedule.add_argument("--every", type=positive_duration, help="interval inside the daily window, e.g. 45m")
     add.add_argument("--between", type=reminder_window, metavar="START-END",
-                     help="daily clock-time window for --every, e.g. 08:00-21:00")
+                     help="daily window for --every, e.g. 8am-9pm or 08:00-21:00")
     first_alert = add.add_mutually_exclusive_group()
     first_alert.add_argument("--at-start", action="store_true", default=None,
                              help="also alert as soon as the daily window opens")
@@ -1953,22 +2113,43 @@ def add_reminder_options(add, editing):
         end_bound.add_argument("--clear-until", dest="until", action="store_const", const="",
                          help="remove the end boundary")
     days = add.add_mutually_exclusive_group()
-    days.add_argument("--date", type=reminder_date, help="run once on YYYY-MM-DD with --at")
+    days.add_argument("--date", type=calendar_date, help="run once on YYYY-MM-DD with --at")
     days.add_argument("--month-day", type=month_day_number,
-                      help="repeat on this day of the month, skipping shorter months")
+                      help="day of the month (1–31), skipping months without that day")
     days.add_argument("--days", type=reminder_days,
                      help="all (default), weekdays, weekends, or mon,wed,fri")
     add.add_argument("--timezone", type=timezone_policy, metavar="ZONE",
                      help=("system: follow system time zone changes (default)\n"
                            "local-fixed: pin the current system time zone\n"
                            "UTC or Asia/Kolkata: pin a named time zone"))
+    add.add_argument("-d", "--description",
+                     help="notification message; pass an empty string to clear it")
     add.add_argument("--action", choices=("notify", "alarm"),
                      help="notify: desktop notification (default)\n"
                           "alarm: desktop notification with a ringing alert")
 
 
+class TickHelpFormatter(argparse.HelpFormatter):
+    def __init__(self, prog):
+        width = max(16, shutil.get_terminal_size((80, 24)).columns - 2)
+        super().__init__(prog, width=width, max_help_position=28 if width >= 52 else 4)
+
+    def _format_action_invocation(self, action):
+        if action.option_strings and action.nargs != 0:
+            # Format a copy so the usage line and parser still expect a value.
+            action = copy(action)
+            action.nargs = 0
+        return super()._format_action_invocation(action)
+
+    def _split_lines(self, text, width):
+        # Keep intentional line breaks, such as the separate timezone choices.
+        return [line for paragraph in text.splitlines()
+                for line in (textwrap.wrap(paragraph, width) or [""])]
+
+
 class TickParser(argparse.ArgumentParser):
     def __init__(self, *args, help_rows=(), examples=(), **kwargs):
+        kwargs.setdefault("formatter_class", TickHelpFormatter)
         super().__init__(*args, **kwargs)
         self.help_rows = help_rows
         self.examples = examples

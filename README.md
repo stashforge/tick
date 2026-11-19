@@ -7,7 +7,7 @@
 Download the executable from the repository and install it in a directory on your `PATH`:
 
 ```sh
-curl -fLO https://raw.githubusercontent.com/stashforge/tick/v0.1.3/tick
+curl -fLO https://raw.githubusercontent.com/stashforge/tick/v0.1.4/tick
 mkdir -p ~/.local/bin
 install -m 755 tick ~/.local/bin/tick
 tick --version
