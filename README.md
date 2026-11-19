@@ -7,7 +7,7 @@
 Download the executable from the repository and install it in a directory on your `PATH`:
 
 ```sh
-curl -fLO https://raw.githubusercontent.com/stashforge/tick/v0.1.0/tick
+curl -fLO https://raw.githubusercontent.com/stashforge/tick/v0.1.2/tick
 mkdir -p ~/.local/bin
 install -m 755 tick ~/.local/bin/tick
 tick --version
@@ -38,6 +38,7 @@ tick service start
 tick remind add "Drink water" --every 45m --between 8am-9pm --at-start
 tick remind add "Take a break" --at 4pm --days weekdays --action alarm
 tick remind show "Drink water"
+tick remind test "Drink water"
 tick remind pause "Drink water" --for 2h
 tick remind list
 tick remind log
@@ -47,7 +48,13 @@ Interval reminders start one interval after the window opens. Use `--at-start` f
 
 Reminders follow the system time zone by default. Use `--timezone local-fixed` to pin the current zone or pass a named zone such as `Asia/Kolkata` or `UTC`. Missed alerts are skipped. Saved schedules are personal to the account that created them.
 
+Use `tick remind test NAME` to try a saved notification or alarm immediately. It leaves the schedule and delivery history untouched.
+
 Use `tick service status` to check the scheduler or `tick remind run` to run it in the foreground. Run `tick remind add -h` for schedule options.
+
+## Termux
+
+Run timers, Pomodoro, and study commands in the foreground with `python tick`. When `termux-notification` is available through Termux:API, alerts post basic Android notifications. Use the terminal to silence the timer or advance a Pomodoro phase. Background Android reminders are outside this integration.
 
 ## Completion and updates
 

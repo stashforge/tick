@@ -33,7 +33,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 UPDATE_REPOSITORY = "stashforge/tick"
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "studytimer"
@@ -558,15 +558,27 @@ def drain_sound():
             stop_sound()
 
 
+def post_notification(title, body):
+    if not CFG["notify"]:
+        return
+    if shutil.which("termux-notification"):
+        command = ["termux-notification", "--title", title, "--content", body]
+    elif shutil.which("notify-send"):
+        command = ["notify-send", "-a", "tick", title, body]
+    else:
+        return
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def notify(title, body):
     play_sound()
     if CFG["bell"]:
         sys.stdout.write("\a")
         sys.stdout.flush()
-    if CFG["notify"] and shutil.which("notify-send"):
-        subprocess.Popen(["notify-send", "-a", "studytimer", title, body],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+    post_notification(title, body)
 
 RING_EVERY = 4  # seconds between repeated alerts
 
@@ -574,11 +586,14 @@ RING_EVERY = 4  # seconds between repeated alerts
 def _notify_persistent(title, body, stop, actions=("stop=Stop",)):
     """Return a notification handle with the chosen action, if any."""
     h = {"proc": None, "id": None, "closing": False, "action": ""}
+    if CFG["notify"] and shutil.which("termux-notification"):
+        post_notification(title, body)
+        return h
     if not (CFG["notify"] and shutil.which("notify-send")):
         return h
     try:
         p = subprocess.Popen(
-            ["notify-send", "-a", "studytimer", "-u", "critical", "--print-id",
+            ["notify-send", "-a", "tick", "-u", "critical", "--print-id",
              *[f"--action={action}" for action in actions], "--wait", title, body],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     except OSError:
@@ -597,8 +612,7 @@ def _notify_persistent(title, body, stop, actions=("stop=Stop",)):
             if p.returncode == 0:
                 stop.set()
             else:  # old libnotify without --wait/--action: fall back to a plain notification
-                subprocess.Popen(["notify-send", "-a", "studytimer", title, body],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                post_notification(title, body)
         except Exception:
             pass
 
@@ -1553,6 +1567,22 @@ def cmd_remind(args):
             if command == "log":
                 reminder_history(db, args.name, args.limit, local[0])
                 return
+            if command == "test":
+                row = db.execute("SELECT action FROM reminders WHERE name = ?", (args.name,)).fetchone()
+                if row is None:
+                    sys.exit(f"No reminder named {args.name!r}.")
+                print(f"Testing {args.name} ({row[0]}).", flush=True)
+                result = launch_reminder(args.name, row[0])
+                try:
+                    status = result.wait()
+                except KeyboardInterrupt:
+                    if result.poll() is None:
+                        result.send_signal(signal.SIGINT)
+                        result.wait()
+                    raise
+                if status:
+                    sys.exit(status)
+                return
             with db:
                 if command != "show":
                     db.execute("BEGIN IMMEDIATE")
@@ -1650,17 +1680,32 @@ def launch_reminder(name, action):
     )
 
 
-def dispatch_due_reminders(db, local, previous, now, pending):
-    rules = db.execute(f"SELECT {REMINDER_COLUMNS} FROM reminders").fetchall()
+def dispatch_due_reminders(db, local, previous, now, pending, rules=None, next_due=None):
+    if rules is None:
+        rules = db.execute(f"SELECT {REMINDER_COLUMNS} FROM reminders").fetchall()
+    if next_due is None:
+        next_due = {}
     for rule in rules:
         name, _, _, policy, action = rule[:5]
         reminder_id, changed = rule[-2:]
-        after = max(previous, datetime.fromisoformat(changed)) if changed else previous
         try:
-            zone = reminder_zone(policy, local)
-            due = next(upcoming_reminders(rule, zone, after, 1), None)
+            if reminder_id not in next_due:
+                after = max(previous, datetime.fromisoformat(changed)) if changed else previous
+                zone = reminder_zone(policy, local)
+                next_due[reminder_id] = next(upcoming_reminders(rule, zone, after, 1), None)
+            due = next_due[reminder_id]
             if due is None or due > now:
                 continue
+            zone = reminder_zone(policy, local)
+            # A short scheduling delay can span multiple occurrences. Send the latest.
+            candidate_limit = int((now - due).total_seconds()) + 2
+            for occurrence in upcoming_reminders(rule, zone, due, candidate_limit):
+                if occurrence > now:
+                    next_due[reminder_id] = occurrence
+                    break
+                due = occurrence
+            else:
+                next_due.pop(reminder_id, None)
             wall = due.astimezone(zone).replace(tzinfo=None).isoformat()
         except (ZoneInfoNotFoundError, ValueError, OverflowError) as error:
             print(f"{name}: {error}", file=sys.stderr, flush=True)
@@ -1709,6 +1754,10 @@ def scheduler_loop(db, stopping):
     print("tick reminder scheduler running", flush=True)
     previous = datetime.now(timezone.utc)
     previous_zone = None
+    local = None
+    data_version = None
+    rules = []
+    next_due = {}
     previous_tick = time.monotonic()
     pending = {}
     try:
@@ -1719,15 +1768,24 @@ def scheduler_loop(db, stopping):
                     detail = "" if result == 0 else f"delivery exited with status {result}"
                     finish_delivery(db, identity, "dispatched" if result == 0 else "failed", detail)
                     del pending[identity]
-            local = system_zone()
             stat = Path("/etc/localtime").stat()
-            zone_key = (local[1], stat.st_ino, stat.st_mtime_ns)
+            zone_key = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            zone_changed = previous_zone is not None and zone_key != previous_zone
+            if local is None or zone_changed:
+                local = system_zone()
+            version = db.execute("PRAGMA data_version").fetchone()[0]
+            if version != data_version:
+                rules = db.execute(f"SELECT {REMINDER_COLUMNS} FROM reminders").fetchall()
+                data_version = version
+                next_due.clear()
             now = datetime.now(timezone.utc)
             tick = time.monotonic()
             wall_delta = (now - previous).total_seconds()
-            if (previous_zone is None or zone_key == previous_zone) and 0 < wall_delta <= 3:
-                if abs(wall_delta - (tick - previous_tick)) <= 1:
-                    dispatch_due_reminders(db, local, previous, now, pending)
+            if not zone_changed and 0 < wall_delta <= 3 and abs(wall_delta - (tick - previous_tick)) <= 1:
+                dispatch_due_reminders(db, local, previous, now, pending, rules, next_due)
+            else:
+                # After sleep or a clock change, skip the elapsed window.
+                next_due.clear()
             previous, previous_tick, previous_zone = now, tick, zone_key
     finally:
         for identity, process in pending.items():
@@ -1840,6 +1898,7 @@ def add_reminder_commands(sub):
                    ("resume <name>", "Resume a paused reminder"),
                    ("remove <name>", "Remove a reminder and keep its history"),
                    ("log [name]", "Show recent delivery attempts"),
+                   ("test <name>", "Send a test alert without changing its schedule"),
                    ("run", "Run the scheduler in the foreground")),
         examples=(("tick remind add water", "--at 9am --days weekdays --timezone system"),),
     )
@@ -1851,7 +1910,7 @@ def add_reminder_commands(sub):
             formatter_class=argparse.RawTextHelpFormatter,
         )
         add_reminder_options(parser, editing=verb == "edit")
-    for verb in ("show", "remove", "pause", "resume"):
+    for verb in ("show", "remove", "pause", "resume", "test"):
         parser = commands.add_parser(verb)
         parser.add_argument("name", type=reminder_name)
         add_user_flag(parser)
@@ -2072,7 +2131,7 @@ def completion_candidates(parser, current, words):
     if positional_count < len(positionals):
         action = positionals[positional_count]
         if (action.type is reminder_name
-                and parser.prog.partition(" remind ")[2] in ("show", "edit", "pause", "resume", "remove", "log")):
+                and parser.prog.partition(" remind ")[2] in ("show", "edit", "pause", "resume", "remove", "log", "test")):
             return personal_reminder_names()
         return completion_values(action)
     return ()
@@ -2167,6 +2226,13 @@ def replace_tick(path, source, mode):
             temporary.unlink(missing_ok=True)
 
 
+def restart_tick_service(command):
+    subprocess.run([*command, "restart", SERVICE_NAME], check=True, timeout=30)
+    for _ in range(3):
+        time.sleep(0.5)
+        subprocess.run([*command, "is-active", "--quiet", SERVICE_NAME], check=True, timeout=10)
+
+
 def install_tick_release(path, previous, payload, version):
     service = shutil.which("systemctl")
     command = [service, "--user"] if service else None
@@ -2177,11 +2243,11 @@ def install_tick_release(path, previous, payload, version):
     replace_tick(path, payload, mode)
     if active:
         try:
-            subprocess.run([*command, "restart", SERVICE_NAME], check=True, timeout=30)
+            restart_tick_service(command)
         except (OSError, subprocess.SubprocessError) as error:
             replace_tick(path, previous, mode)
             try:
-                subprocess.run([*command, "restart", SERVICE_NAME], check=True, timeout=30)
+                restart_tick_service(command)
             except (OSError, subprocess.SubprocessError):
                 raise ValueError("restored the previous executable, but the reminder service did not restart") from error
             raise ValueError("restart failed, so the previous version was restored and restarted") from error
