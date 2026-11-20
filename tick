@@ -34,7 +34,7 @@ from urllib.error import HTTPError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 UPDATE_REPOSITORY = "stashforge/tick"
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "studytimer"
@@ -243,17 +243,53 @@ DIGITS = {
 }
 
 
-def large_clock(clock, scale):
-    rows = []
+def large_clock(clock, scale, colon_gap=2):
+    half_rows = []
     for row in range(5):
         glyphs = ["".join(("█" if pixel == "1" else " ") * scale
                           for pixel in DIGITS[char][row]) for char in clock]
         line = glyphs[0]
         for index, glyph in enumerate(glyphs[1:], start=1):
-            gap = 2 if ":" in clock[index - 1:index + 1] else 1
+            gap = colon_gap if ":" in clock[index - 1:index + 1] else 1
             line += " " * gap + glyph
-        rows.append(line)
-    return rows
+        half_rows.extend([line] * scale)
+
+    # Pack two vertical pixels in each terminal cell without changing the glyph grid.
+    half_blocks = (" ", "▄", "▀", "█")
+    if len(half_rows) % 2:
+        half_rows.append(" " * len(half_rows[0]))
+    return ["".join(half_blocks[2 * (top != " ") + (bottom != " ")]
+                    for top, bottom in zip(half_rows[index], half_rows[index + 1]))
+            for index in range(0, len(half_rows), 2)]
+
+
+def fitting_clock(clock, total, width, height):
+    choices = tuple(clock_forms(clock, total.count(":") == 2))
+    for scale, minimum_height in ((2, 11), (1, 8)):
+        if height < minimum_height:
+            continue
+        for candidate in choices if scale == 2 else choices[-1:]:
+            for colon_gap in (2, 1):
+                rows = large_clock(candidate, scale, colon_gap)
+                if len(rows[0]) <= width:
+                    return rows, scale + 1
+    return [], 0
+
+
+def clock_forms(clock, show_zero_hours):
+    sign = clock[:1] if clock[:1] in ("−", " ") else ""
+    digits = clock[len(sign):].split(":")
+    minutes, seconds = digits[-2:]
+    if len(digits) == 3 or show_zero_hours:
+        hours = (digits[0].lstrip("0") or "0") if len(digits) == 3 else "0"
+        yield f"{sign}{hours.zfill(2)}:{minutes}:{seconds}"
+        if len(hours) == 1:
+            yield f"{sign}{hours}:{minutes}:{seconds}"
+        if hours != "0":
+            return
+    yield f"{sign}{minutes}:{seconds}"
+    if minutes.startswith("0"):
+        yield f"{sign}{minutes[1:]}:{seconds}"
 
 
 class Keys:
@@ -299,17 +335,24 @@ class Keys:
         except OSError:
             pass
 
-    def show(self, title, bar=(), controls="", *, clock=None, total="", fraction=None, state=()):
+    def show(self, title, bar=(), controls="", *, clock=None, total="", fraction=None, state=(), paused=False):
         if not self.live:
             return
-        size = shutil.get_terminal_size((80, 20))
+        try:
+            size = os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            size = shutil.get_terminal_size((80, 20))
         width = max(1, size.columns - 1)
+        if len(state) > 1 and sum(cell_width(char) for text, _ in title for char in text) > width:
+            title = title[:-1]
         if self.alternate:
-            self.show_dashboard(title, bar, controls, clock, total, fraction, state, width, size.lines)
+            self.show_dashboard(title, bar, controls, clock, total, fraction, state, width, size.lines, paused)
             return
         if fraction is not None:
             bar = progress_rule(min(24, width), fraction, clock[1])
         rows = [title, bar, control_parts(controls)]
+        if paused:
+            rows.insert(1, (("Paused", "1;33"),))
         if self.label:
             labels = wrap_label(self.label, width, 2)
             rows[:0] = [((line, "1"),) for line in labels] + [()]
@@ -321,41 +364,50 @@ class Keys:
         sys.stdout.flush()
         self.drawn = len(lines)
 
-    def show_dashboard(self, title, bar, controls, clock, total, fraction, state, width, height):
-        artwork = []
-        scale = 2
-        if clock and height >= 11:
-            artwork = large_clock(clock[0], scale)
-            if len(artwork[0]) > width:
-                scale = 1
-                artwork = large_clock(clock[0], scale)
+    def show_dashboard(self, title, bar, controls, clock, total, fraction, state, width, height, paused=False):
+        artwork, sign_inset = fitting_clock(clock[0], total, width, height) if clock else ([], 0)
         body = [title, bar] if bar else [title]
+        paused_row = (("Paused", "1;33"),) if paused else ()
         clock_width = 0
         if artwork and len(artwork[0]) <= width:
             clock_width = len(artwork[0])
             body = [((row, clock[1]),) for row in artwork]
+            # Remaining and Elapsed are optional if the status line would wrap.
+            reserved = sign_inset + len(total) + 1 if total else 0
+            if len(state) > 1 and reserved + sum(cell_width(char) for text, _ in state for char in text) > clock_width:
+                state = state[:-1]
+            inset_width = sign_inset if total else 0
+            inset = (" " * inset_width, "39")
+            body.append((inset, *progress_rule(clock_width - inset_width, fraction, clock[1]))
+                        if fraction is not None else ())
             if total:
-                inset = (" " * (scale + 1), "39")
-                body.append((inset, *progress_rule(clock_width - len(inset[0]), fraction, clock[1]))
-                            if fraction is not None else ())
                 state = (inset, *state)
+                if paused:
+                    paused_row = (inset, *paused_row)
             state_width = sum(cell_width(char) for text, _ in state for char in text)
-            if total and state_width + len(total) < clock_width:
+            fits_total = bool(total) and state_width + len(total) < clock_width
+            if fits_total:
                 padding = clock_width - state_width - len(total)
-                body.append((*state, (" " * padding + total, "39")))
-            else:
-                body.append(state)
-                if total:
-                    body.append(((total.rjust(clock_width), "39"),))
-        elif total:
+                state = (*state, (" " * padding + total, "39"))
+            body.append(state)
+            if paused_row:
+                body.append(paused_row)
+            if total and not fits_total:
+                body.append(((total.rjust(clock_width), "39"),))
+        elif clock:
+            if paused_row:
+                body.append(paused_row)
             compact_width = min(width, max(len(clock[0]), len(total)))
             if fraction is not None:
                 body.append(progress_rule(compact_width, fraction, clock[1]))
-            body.append(((total.rjust(compact_width), "39"),))
+            if total:
+                body.append(((total.rjust(compact_width), "39"),))
+        elif paused_row:
+            body.append(paused_row)
 
         footer = tuple(control_parts(controls)) if height > 1 else ()
         space = max(1, height - bool(footer))
-        label_inset = scale + 1 if clock_width and total else 0
+        label_inset = sign_inset if clock_width and total else 0
         label_width = (clock_width or width) - label_inset
         labels = wrap_label(self.label, label_width, min(2, max(0, space - len(body))))
         prefix = "" if self.center else " " * label_inset
@@ -774,9 +826,12 @@ def run_phase(keys, label, target, color, count_up=False, can_skip=False):
             clock = fmt_clock(elapsed) if showing_elapsed else f"−{status_clock}"
             state = " · Paused" if paused else ""
             mode = "Elapsed" if showing_elapsed else "Remaining"
-            fraction = min(1, elapsed / target) if target else 1
-            if count_up or not keys.progress:
-                fraction = None
+            fraction = None
+            if keys.progress:
+                if count_up:
+                    fraction = (elapsed % 60) / 60
+                else:
+                    fraction = min(1, elapsed / target) if target else 1
             controls = ["Space resume" if paused else "Space pause"]
             if not count_up:
                 controls.extend(("+/- 1m", "v elapsed/left"))
@@ -785,20 +840,15 @@ def run_phase(keys, label, target, color, count_up=False, can_skip=False):
             controls.extend(("c change sound", "q stop"))
             status_label = f"{label} · {keys.label}" if keys.label else label
             write_status(f"{status_label} {status_clock}{state}")
-            details = ((label, "1"), (f" · {mode}", "90"), (state, "1;33"))
+            details = ((label, "1"), (f" · {mode}", "90"))
             title = ((clock, clock_style), ("  ·  ", "90"), *details)
             artwork_clock = f" {clock}" if showing_elapsed and not count_up else clock
             total = "" if count_up else fmt_clock(target)
             if total.count(":") == 2:
-                sign = " " if showing_elapsed else "−"
-                digits = clock.lstrip("−").split(":")
-                if len(digits) == 2:
-                    digits.insert(0, "0")
-                digits[0] = digits[0].zfill(len(total.split(":")[0]))
-                artwork_clock = sign + ":".join(digits)
+                total = total.zfill(8)
             keys.show(title, controls=" · ".join(controls) if keys.fd is not None else "",
                       clock=(artwork_clock, clock_style), total=total,
-                      fraction=fraction, state=details)
+                      fraction=fraction, state=details, paused=paused)
             if not count_up and elapsed >= target:
                 return int(target), "done", 0, int(target)
 
@@ -965,7 +1015,7 @@ def cmd_stopwatch(a):
     start = datetime.now()
     with Keys(a) as keys:
         secs, why, _, _ = run_phase(keys, "Stopwatch", 0, "36", count_up=True)
-    got = record(start, secs, a.subject, "stopwatch", why != "skip") if a.study else None
+    got = record(start, secs, a.subject, "stopwatch", why != "skip", secs) if a.study else None
     print_elapsed(a, secs, got, why)
 
 
@@ -999,6 +1049,12 @@ def print_elapsed(args, secs, logged, why="quit", left=0):
     print(summary)
 
 
+def study_target(session):
+    if session.get("kind") == "stopwatch":
+        return session["seconds"]
+    return session.get("target_seconds")
+
+
 def study_bar(studied, target, width):
     filled = round(width * min(studied, target) / target)
     if studied and not filled:
@@ -1028,7 +1084,7 @@ def cmd_stats(a):
         day = session["start"][:10]
         by_day[day] += session["seconds"]
         session_counts[day] += 1
-        target = session.get("target_seconds")
+        target = study_target(session)
         if target is None:
             untargeted.add(day)
         else:
@@ -1152,7 +1208,7 @@ def print_study_sessions(sessions, heading):
     rows = []
     for session in sessions:
         start = session["start"]
-        target = session.get("target_seconds")
+        target = study_target(session)
         target_text = fmt_dur(target) if target is not None else "—"
         if target is not None and session.get("target_estimated"):
             target_text = "~" + target_text
@@ -1295,7 +1351,8 @@ def add_timer_commands(sub, study):
         command.add_argument(*bold_flags, action="store_true", help="use bold clock colors")
         progress = command.add_mutually_exclusive_group()
         progress.add_argument("-P", "--progress", action="store_true",
-                              help="show countdown progress in the divider")
+                              help=("show progress through the current minute" if command is stopwatch
+                                    else "show countdown progress in the divider"))
         progress.add_argument("--no-progress", dest="progress", action="store_false",
                               help=argparse.SUPPRESS)
         if study:
